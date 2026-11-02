@@ -1,0 +1,866 @@
+<script lang="ts">
+	import { online } from 'svelte/reactivity/window';
+	import { Menu } from '@ark-ui/svelte/menu';
+	import { Portal } from '@ark-ui/svelte/portal';
+	import type { MailboxDTO } from '#lib/mail/types';
+	import type { RowGroup, ListRow } from '#lib/mail/rows';
+	import type { BulkAction, ListFilter } from '../../../routes/mail.remote';
+	import { CATEGORIES, CATEGORY_OTHER, categoryLabel } from '@zaur/mail-core';
+	import { filterKeyword, filterName } from '#lib/mail/labels';
+	import { acceptsMoves } from '#lib/mail/folders';
+	import { formatListTime, formatReaderTime, initials } from '#lib/mail/rows';
+	import {
+		CHANNELS,
+		channelStyle,
+		identityStyle,
+		mailboxChannel,
+		messageChannel
+	} from '#lib/mail/colors';
+	import { searchOperatorHint } from '@zaur/mail-core';
+	import ActionIcon from './ActionIcon.svelte';
+	import { prefs } from '#lib/settings.svelte.ts';
+	import { viewport } from '#lib/viewport.svelte.ts';
+
+	interface Props {
+		/** The page hides this pane on a phone while the reader is open. */
+		class?: string;
+		mailbox: MailboxDTO | null;
+		mailboxes: MailboxDTO[] | undefined;
+		groups: RowGroup[] | undefined;
+		loading: boolean;
+		error: unknown;
+		/** All | Unseen | Flagged — the header's segmented control. */
+		filter: ListFilter;
+		cursorId: string | null;
+		/** The thread in the reader — the one row that has to be findable at a glance. */
+		openThreadId?: string | null;
+		selection: Set<string>;
+		onFilter: (value: ListFilter) => void;
+		/** Non-empty while the list is showing results rather than a folder. */
+		searchQuery?: string;
+		onClearSearch?: () => void;
+		onSetSelection: (ids: Set<string>) => void;
+		onToggleSelect: (threadId: string) => void;
+		onOpen: (threadId: string) => void;
+		/** Without `threadIds` the action runs on the selection; with them, on those rows. */
+		onBulk: (action: BulkAction, mailboxId?: string, threadIds?: string[]) => void;
+		busy?: boolean;
+		onRetry: () => void;
+		onNewMessage: (anchor: { left: number; top: number; right: number; bottom: number }) => void;
+		/** Older mail than the list holds. */
+		hasMore?: boolean;
+		onLoadMore?: () => void;
+		/** Results come from every folder, not only `mailbox`. */
+		searchAll?: boolean;
+		onSearchAll?: (all: boolean) => void;
+		/** Trash and Spam: delete everything in the folder. */
+		onEmpty?: () => void;
+	}
+
+	let {
+		class: className = '',
+		mailbox,
+		mailboxes,
+		groups,
+		loading,
+		error,
+		filter,
+		cursorId,
+		openThreadId = null,
+		selection,
+		searchQuery = '',
+		onClearSearch,
+		onFilter,
+		onSetSelection,
+		onToggleSelect,
+		onOpen,
+		onBulk,
+		busy = false,
+		onRetry,
+		onNewMessage,
+		hasMore = false,
+		onLoadMore,
+		searchAll = false,
+		onSearchAll,
+		onEmpty
+	}: Props = $props();
+
+	/**
+	 * The end of the list coming into view asks for more, so a scroll never hits
+	 * a wall; the button is there for the keyboard, and in case this does not fire.
+	 */
+	function nearEnd(node: HTMLElement) {
+		const observer = new IntersectionObserver(
+			(entries) => {
+				if (entries[0]?.isIntersecting && !loading) onLoadMore?.();
+			},
+			{ rootMargin: '200px' }
+		);
+		observer.observe(node);
+		return () => observer.disconnect();
+	}
+
+	let listContainer = $state<HTMLDivElement | undefined>();
+
+	const flatRows = $derived((groups ?? []).flatMap((group) => group.rows));
+	const selectedRows = $derived(flatRows.filter((row) => selection.has(row.threadId)));
+	/** Toggles act on the majority state: all-read selection → "Mark unread". */
+	const allRead = $derived(selectedRows.length > 0 && selectedRows.every((row) => !row.unread));
+	const allStarred = $derived(selectedRows.length > 0 && selectedRows.every((row) => row.starred));
+	const allImportant = $derived(selectedRows.length > 0 && selectedRows.every((row) => row.important));
+	const moveTargets = $derived(
+		(mailboxes ?? []).filter((box) => box.id !== mailbox?.id && acceptsMoves(box))
+	);
+	/** Archive is the one move worth a button of its own on the row. */
+	const archiveTarget = $derived(
+		(mailboxes ?? []).find((box) => box.kind === 'archive' && box.id !== mailbox?.id)
+	);
+	const folderChannel = $derived(mailboxChannel(mailbox?.kind));
+	/** In Trash a delete destroys; results from every folder only ever go to Trash. */
+	const destroys = $derived(mailbox?.kind === 'trash' && !(searchQuery && searchAll));
+
+	$effect(() => {
+		if (!cursorId || !listContainer) return;
+		const element = listContainer.querySelector(`[data-row-id="${CSS.escape(cursorId)}"]`);
+		element?.scrollIntoView({ block: 'nearest' });
+		const active = document.activeElement;
+		if (active === document.body || (active && listContainer.contains(active))) {
+			element?.querySelector<HTMLElement>('.z-row-open')?.focus({ preventScroll: true });
+		}
+	});
+
+	/**
+	 * The list is one tab stop: the cursor row, else the open one, else the
+	 * first. j / k (and the arrows, inside the list) move it, and focus goes
+	 * with it while the keyboard is in the list, so a screen reader reads the
+	 * row the cursor is on.
+	 */
+	const focusId = $derived(
+		[cursorId, openThreadId].find((id) => id && flatRows.some((row) => row.threadId === id)) ??
+			flatRows[0]?.threadId ??
+			null
+	);
+
+	/** What a row says to a screen reader: the state its colour and weight show, then who, what and when. */
+	function rowLabel(row: ListRow): string {
+		return [
+			row.unread && 'Unread',
+			row.starred && 'Flagged',
+			row.important && 'Important',
+			row.senderLabel,
+			row.subject || '(no subject)',
+			// The row shows only the time; a screen reader gets the day the divider shows.
+			formatReaderTime(row.receivedAt),
+			row.messageCount > 1 && `${row.messageCount} messages`,
+			row.hasAttachment && 'has attachment'
+		]
+			.filter(Boolean)
+			.join(', ');
+	}
+
+	function selectAll() {
+		onSetSelection(new Set(flatRows.map((row) => row.threadId)));
+	}
+
+	function selectNone() {
+		onSetSelection(new Set());
+	}
+
+	function selectWhere(predicate: (row: ListRow) => boolean) {
+		onSetSelection(new Set(flatRows.filter(predicate).map((row) => row.threadId)));
+	}
+
+	/** Row buttons sit inside a row that opens on click — never let one through. */
+	function rowAction(
+		event: MouseEvent,
+		threadId: string,
+		action: BulkAction,
+		mailboxId?: string
+	) {
+		event.stopPropagation();
+		if (busy) return;
+		onBulk(action, mailboxId, [threadId]);
+	}
+
+	/**
+	 * A row's channel: a flag outranks the server's "important", then the
+	 * category says what it is, then the folder — mail you wrote, mail that is
+	 * gone. In search results a row's own mailbox is what counts, not the one
+	 * the search ran from.
+	 */
+	function rowChannel(row: ListRow) {
+		const kind = searchQuery && searchAll
+			? (mailboxes ?? []).find((box) => box.id === row.mailboxId)?.kind
+			: mailbox?.kind;
+		return messageChannel({ mailboxKind: kind, starred: row.starred, important: row.important, category: row.category });
+	}
+
+	const EMPTY_COPY: Record<string, { title: string; hint: string }> = {
+		inbox: { title: 'Inbox zero', hint: 'Unseen messages appear here as soon as they arrive.' },
+		drafts: { title: 'No drafts', hint: 'Composing a message saves a draft here automatically.' },
+		sent: { title: 'Nothing sent yet', hint: 'Messages you send will show up here.' },
+		archive: { title: 'Archive is empty', hint: 'Move messages here to keep the inbox quiet.' },
+		junk: { title: 'No junk', hint: 'Messages marked as junk land here.' },
+		trash: { title: 'Trash is empty', hint: 'Deleted messages stay here before final removal.' },
+		scheduled: { title: 'Nothing scheduled', hint: 'Messages you schedule wait here until they go out.' }
+	};
+
+	/** The list's own width: under 430px the Flagged segment has no room and moves into the Label select. */
+	let width = $state(0);
+	const narrow = $derived(width > 0 && width < 430);
+	/** A label (not Flagged while it has its own segment) is narrowing the folder. */
+	const labelled = $derived(filter === 'important' || filter.startsWith('cat:') || (narrow && filter === 'flagged'));
+
+	// An empty label is not an empty folder: "Inbox zero" over a filtered inbox would lie.
+	const emptyCopy = $derived(
+		filterKeyword(filter)
+			? {
+					title: `Nothing labelled ${filterName(filter)}`,
+					hint: `No message in ${mailbox?.name ?? 'this folder'} carries this label.`
+				}
+			: (EMPTY_COPY[mailbox?.kind ?? ''] ?? {
+					title: `Nothing in ${mailbox?.name ?? 'this folder'}`,
+					hint: 'Messages will appear here as soon as they arrive.'
+				})
+	);
+</script>
+
+<section
+	bind:clientWidth={width}
+	class="@container flex h-full min-h-0 flex-col overflow-hidden bg-[var(--z-surface)] select-none {className}"
+	aria-label="Message list"
+>
+	<h1 class="sr-only">{searchQuery ? `Search results for ${searchQuery}` : (mailbox?.name ?? 'Mail')}</h1>
+	<!--
+		The header swaps its contents rather than growing a second bar: a list
+		that jumps under you the moment you tick a box is the worst time to move
+		it. With a selection up it wears the correspondence fill, so selection
+		reads as one object with the rows it is about. On a phone this bar is
+		hidden — PhoneMailBar is the one row, above the panes. The height is the
+		bar's, hairline included, and the reader's toolbar beside it has the same
+		(taller under a coarse pointer, where its buttons grow to a fingertip):
+		the two share one bottom line, and rows never move when the bar swaps.
+	-->
+	<div class="z-list-bar h-[46px] shrink-0 border-b border-[var(--z-hairline)] max-md:hidden pointer-coarse:h-[60px] {selection.size > 0 ? 'p-1.5' : ''}">
+		<div
+			class="flex h-full items-center justify-between gap-3 {selection.size > 0
+				? 'z-bulk rounded-[10px] border border-[var(--z-accent-stroke)] bg-[var(--z-accent-soft)] px-1'
+				: 'px-3.5 max-md:px-3'}"
+		>
+			<div class="flex min-w-0 items-center gap-2">
+				<!-- Select menu trigger — the one control both modes keep. -->
+				<Menu.Root positioning={{ placement: 'bottom-start', gutter: 6, overflowPadding: 12 }} lazyMount unmountOnExit>
+					<Menu.Trigger
+						class="btn-tactile !h-7 gap-1.5 !px-2 {selection.size > 0 ? '!border-[var(--z-accent-line)]' : ''}"
+						aria-label="Selection options"
+					>
+						<span class="hobday-checkbox" data-checked={selection.size > 0} aria-hidden="true"></span>
+						<ActionIcon name="chevron" class="size-3 text-[var(--z-faint)]" />
+					</Menu.Trigger>
+					<Portal>
+						<Menu.Positioner>
+							<Menu.Content class="z-menu z-40 w-[184px]">
+								<div class="z-menu-caption">Select</div>
+								<Menu.Item value="all" onSelect={selectAll} class="z-menu-item">All</Menu.Item>
+								<Menu.Item value="none" onSelect={selectNone} class="z-menu-item">None</Menu.Item>
+								<Menu.Item value="unseen" onSelect={() => selectWhere((row) => row.unread)} class="z-menu-item">Unseen</Menu.Item>
+								<Menu.Item value="seen" onSelect={() => selectWhere((row) => !row.unread)} class="z-menu-item">Seen</Menu.Item>
+								<Menu.Item value="flagged" onSelect={() => selectWhere((row) => row.starred)} class="z-menu-item">Flagged</Menu.Item>
+							</Menu.Content>
+						</Menu.Positioner>
+					</Portal>
+				</Menu.Root>
+
+				{#if selection.size > 0}
+					<span class="shrink-0 text-[13px] font-semibold text-[var(--z-accent-ink)] tabular-nums">
+						{selection.size}<span class="@max-[430px]:sr-only">&nbsp;selected</span>
+					</span>
+				{:else if searchQuery}
+					<!--
+						Unseen does not scope a search — the query does — so showing the
+						filter here would be a control that lies. The query takes its place.
+					-->
+					<div class="z-field flex !h-7 min-w-0 items-center gap-1.5 !py-0 !pr-0.5 !pl-2">
+						<svg class="size-3.5 shrink-0 text-[var(--z-faint)]" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+							<circle cx="7" cy="7" r="4.4" stroke="currentColor" stroke-width="1.4" />
+							<path d="M10.4 10.4L14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+						</svg>
+						<span class="min-w-0 truncate text-xs font-semibold text-[var(--z-ink)]">{searchQuery}</span>
+						{#if onClearSearch}
+							<button type="button" class="z-icon-btn !size-6" aria-label="Clear search" title="Clear search (esc)" onclick={onClearSearch}>
+								<svg class="size-3" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+									<path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+								</svg>
+							</button>
+						{/if}
+					</div>
+				{:else}
+					<!-- Filter: All | Unseen | Flagged -->
+					<div class="z-group" role="group" aria-label="Filter">
+						<button type="button" class="z-segment !h-6 !px-2.5" aria-pressed={filter === 'all'} onclick={() => onFilter('all')}>
+							All
+						</button>
+						<button type="button" class="z-segment !h-6 !px-2.5" aria-pressed={filter === 'unseen'} onclick={() => onFilter('unseen')}>
+							Unseen
+						</button>
+						{#if !narrow}
+							<button type="button" class="z-segment !h-6 !px-2.5" aria-pressed={filter === 'flagged'} onclick={() => onFilter('flagged')}>
+								Flagged
+							</button>
+						{/if}
+						<!--
+							The rest of the sidebar's Labels, in one select to keep the group
+							short — so a label ticked there is never a filter this header hides.
+						-->
+						<select
+							class="z-segment !h-6 !px-2 !pr-1 appearance-none"
+							aria-label="Label"
+							aria-pressed={labelled}
+							value={labelled ? filter : ''}
+							onchange={(event) => onFilter((event.currentTarget.value || 'all') as ListFilter)}
+						>
+							<option value="">Label…</option>
+							{#if narrow}<option value="flagged">Flagged</option>{/if}
+							<option value="important">Important</option>
+							{#each CATEGORIES as category (category.id)}
+								<option value="cat:{category.id}">{category.label}</option>
+							{/each}
+						</select>
+					</div>
+				{/if}
+			</div>
+
+			<div class="flex shrink-0 items-center gap-2">
+				{#if selection.size > 0}
+					<!-- The same four actions a row offers on hover, in the same icons. -->
+					<div class="z-group !border-[var(--z-accent-line)]" role="group" aria-label="Selection actions">
+						<button
+							type="button"
+							class="z-icon-btn {allStarred ? '!text-[var(--z-ch-flagged-solid)] hover:!bg-[var(--z-ch-flagged-hover)]' : ''}"
+							disabled={busy}
+							aria-label={allStarred ? 'Remove flag' : 'Flag'}
+							title={allStarred ? 'Remove flag (s)' : 'Flag (s)'}
+							onclick={() => onBulk(allStarred ? 'unstar' : 'star')}
+						>
+							<ActionIcon name={allStarred ? 'flag-filled' : 'flag'} class="size-[15px]" />
+						</button>
+						<button
+							type="button"
+							class="z-icon-btn {allImportant ? '!text-[var(--z-ch-needs-solid)] hover:!bg-[var(--z-ch-needs-fill)]' : ''}"
+							disabled={busy}
+							aria-label={allImportant ? 'Not important' : 'Mark important'}
+							title={allImportant ? 'Not important (i)' : 'Mark important (i)'}
+							onclick={() => onBulk(allImportant ? 'unimportant' : 'important')}
+						>
+							<ActionIcon name={allImportant ? 'important-filled' : 'important'} class="size-[15px]" />
+						</button>
+						<button
+							type="button"
+							class="z-icon-btn"
+							disabled={busy}
+							aria-label={allRead ? 'Mark unread' : 'Mark read'}
+							title={allRead ? 'Mark unread' : 'Mark read'}
+							onclick={() => onBulk(allRead ? 'unread' : 'read')}
+						>
+							<ActionIcon name={allRead ? 'mail' : 'mail-open'} class="size-[15px]" />
+						</button>
+						{#if archiveTarget}
+							<button type="button" class="z-icon-btn" disabled={busy} aria-label="Archive" title="Archive (e)" onclick={() => onBulk('move', archiveTarget.id)}>
+								<ActionIcon name="archive" class="size-[15px]" />
+							</button>
+						{/if}
+						<button
+							type="button"
+							class="z-icon-btn hover:!bg-[var(--z-ch-discard-hover)] hover:!text-[var(--z-ch-discard-solid)] {destroys ? '!text-[var(--z-ch-discard-solid)]' : ''}"
+							disabled={busy}
+							aria-label={destroys ? 'Delete forever' : 'Delete'}
+							title={destroys ? 'Delete forever (#)' : 'Delete (#)'}
+							onclick={() => onBulk('delete')}
+						>
+							<ActionIcon name="trash" class="size-[15px]" />
+						</button>
+					</div>
+
+					{#if moveTargets.length > 0}
+						<Menu.Root positioning={{ placement: 'bottom-end', gutter: 6, overflowPadding: 12 }} lazyMount unmountOnExit>
+							<Menu.Trigger class="btn-tactile !h-7 shrink-0 gap-1 !border-[var(--z-accent-line)] !px-2.5 !text-[12px] !font-semibold !text-[var(--z-accent-ink)]" disabled={busy}>
+								<!-- A narrow column (a laptop with the sidebar open) keeps the action and drops a word. -->
+								Move<span class="@max-[430px]:hidden">to</span>
+								<ActionIcon name="chevron" class="size-[11px]" />
+							</Menu.Trigger>
+							<Portal>
+								<Menu.Positioner>
+									<Menu.Content class="z-menu z-40 max-h-[320px] w-56 overflow-y-auto">
+										<div class="z-menu-caption">Move to</div>
+										{#each moveTargets as target (target.id)}
+											{@const channel = mailboxChannel(target.kind)}
+											<Menu.Item value={target.id} onSelect={() => onBulk('move', target.id)} class="z-menu-item">
+												<span class="inline-block size-2.5 shrink-0 rounded-[3px] border" style:background-color={channel.fill} style:border-color={channel.stroke} aria-hidden="true"></span>
+												<span class="truncate">{target.name}</span>
+											</Menu.Item>
+										{/each}
+									</Menu.Content>
+								</Menu.Positioner>
+							</Portal>
+						</Menu.Root>
+					{/if}
+
+					<button
+						type="button"
+						class="btn-tactile !size-7 !border-[var(--z-accent-line)] !p-0 !text-[var(--z-accent-ink)]"
+						onclick={selectNone}
+						title="Clear selection (esc)"
+						aria-label="Clear selection"
+					>
+						<svg class="size-3" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+							<path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+						</svg>
+					</button>
+				{:else}
+					{#if flatRows.length > 0}
+						<span class="z-mono text-[11px] text-[var(--z-soft)] @max-[430px]:hidden" title="{flatRows.length} {searchQuery ? 'results' : 'conversations'}">
+							{flatRows.length}
+						</span>
+					{/if}
+					<!-- A quiet 28px on a desk; on a phone it is the one primary control on screen, at 36px. -->
+					<button
+						type="button"
+						data-new-message
+						class="btn-tactile !p-0 {viewport.phone ? 'btn-primary !size-9' : '!size-7'}"
+						onclick={(event) => onNewMessage(event.currentTarget.getBoundingClientRect())}
+						title="New message (c)"
+						aria-label="New message"
+					>
+						<svg class="{viewport.phone ? 'size-[17px] text-white' : 'size-[15px] text-[var(--z-body)]'}" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+							<path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
+						</svg>
+					</button>
+				{/if}
+			</div>
+		</div>
+	</div>
+
+	<!-- Scrollable list -->
+	<div
+		bind:this={listContainer}
+		class="min-h-0 flex-1 overflow-y-auto px-3.5 pb-3 [scroll-padding-top:34px] max-md:px-3 overscroll-contain"
+	>
+		{#if error}
+			<div class="z-railed z-alert z-tone-discard mt-3 flex items-start gap-[9px]" role="alert">
+				<svg class="mt-px size-[15px] shrink-0" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+					<circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.4" />
+					<path d="M8 5v3.6M8 10.7v.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+				</svg>
+				<div class="min-w-0 flex-1">
+					<span class="z-alert-title">Couldn't load messages</span>
+					<span class="mt-0.5 block">{online.current === false ? "You're offline." : "The mail server couldn't be reached."}</span>
+				</div>
+				<button type="button" class="btn-tactile !h-7 shrink-0 !border-[var(--z-ch-discard-line)] !px-2.5 !text-[12px] !font-semibold !text-[var(--z-ch-discard-ink)] max-md:!h-11 max-md:!px-3.5 max-md:!text-[13px]" onclick={onRetry}>Retry</button>
+			</div>
+		{:else if loading && !groups}
+			<div class="flex flex-col gap-2 pt-3" aria-hidden="true">
+				{#each [['34%', '72%', '58%'], ['28%', '64%', '48%'], ['40%', '80%', '52%'], ['30%', '68%', '44%'], ['36%', '76%', '60%']] as widths, index (index)}
+					<div class="z-railed z-skeleton rounded-[10px] border border-[var(--z-hairline)] bg-[var(--z-surface)] py-3 pr-3 pl-[18px]" style:--z-rail="var(--z-hairline)" style:--z-rail-inset="12px">
+						<div class="flex items-start gap-[11px]">
+							<span class="size-[30px] shrink-0 rounded-[8px] bg-[var(--z-sunken)]"></span>
+							<div class="flex flex-1 flex-col gap-[7px]">
+								<span class="block h-[11px] rounded-[4px] bg-[var(--z-sunken)]" style:width={widths[0]}></span>
+								<span class="block h-[11px] rounded-[4px] bg-[var(--z-sunken)]" style:width={widths[1]}></span>
+								<span class="block h-[11px] rounded-[4px] bg-[var(--z-sunken)]" style:width={widths[2]}></span>
+							</div>
+						</div>
+					</div>
+				{/each}
+			</div>
+		{:else if groups && groups.length === 0 && searchQuery}
+			<!-- No results is a different empty than an empty folder, and the useful
+			     thing to offer is what the query language can do. -->
+			<div class="z-card mt-3 flex flex-col items-center gap-1 px-4 py-[18px] text-center">
+				<span class="z-tile mb-1.5" style={channelStyle(CHANNELS.digest)}>
+					<svg class="size-5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+						<circle cx="7" cy="7" r="4.4" stroke="currentColor" stroke-width="1.4" />
+						<path d="M10.4 10.4L14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+					</svg>
+				</span>
+				<p class="text-[14px] font-bold text-[var(--z-ink)]">No matches</p>
+				<p class="max-w-[300px] text-[12.5px] leading-relaxed text-[var(--z-muted)]">
+					Nothing in {searchAll ? 'any folder' : (mailbox?.name ?? 'this folder')} matches
+					<span class="font-medium text-[var(--z-strong)]">{searchQuery}</span>.
+				</p>
+				<p class="z-mono mt-2 max-w-[320px] text-[10.5px] leading-relaxed max-md:text-[12px] text-[var(--z-soft)]">{searchOperatorHint()}</p>
+				<div class="mt-3 flex gap-2">
+					{#if !searchAll && onSearchAll}
+						<button type="button" class="btn-tactile btn-primary !h-8 max-md:!h-11" onclick={() => onSearchAll(true)}>Search all folders</button>
+					{/if}
+					{#if onClearSearch}
+						<button type="button" class="btn-tactile !h-8 max-md:!h-11" onclick={onClearSearch}>Clear search</button>
+					{/if}
+				</div>
+			</div>
+		{:else if groups && groups.length === 0}
+			<!-- The empty folder wears its own channel — the hue its row, switcher
+			     and count already wear — so "Nothing in Memos" is violet, "No
+			     drafts" amber, and only Junk and Trash are red. -->
+			<div class="z-card mt-3 flex flex-col items-center gap-1 px-4 py-[18px] text-center">
+				<span class="z-tile mb-1.5" style={channelStyle(mailboxChannel(mailbox?.kind))}>
+					<svg class="size-5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+						<path d="M2.5 4h11a1 1 0 011 1v7a1 1 0 01-1 1h-11a1 1 0 01-1-1V5a1 1 0 011-1z" stroke="currentColor" stroke-width="1.3" />
+						<path d="M2.5 5.5l5.5 4 5.5-4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+					</svg>
+				</span>
+				<p class="text-[14px] font-bold text-[var(--z-ink)]">{emptyCopy.title}</p>
+				<p class="max-w-[260px] text-[12.5px] leading-relaxed text-[var(--z-muted)]">{emptyCopy.hint}</p>
+				{#if filterKeyword(filter)}
+					<button type="button" class="btn-tactile mt-3 !h-8 max-md:!h-11 max-md:!px-4" onclick={() => onFilter('all')}>Show all</button>
+				{:else}
+					<button type="button" class="btn-tactile mt-3 !h-8 max-md:!h-11" onclick={(event) => onNewMessage(event.currentTarget.getBoundingClientRect())}>
+						<svg class="size-3.5 text-[var(--z-strong)]" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+							<path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+						</svg>
+						New message
+					</button>
+				{/if}
+			</div>
+		{:else if groups}
+			{#if onEmpty && !searchQuery && (mailbox?.kind === 'trash' || mailbox?.kind === 'junk')}
+				<div class="z-note mt-3 flex items-center gap-3 py-1.5 pr-1.5">
+					<span class="min-w-0 flex-1">Empty {mailbox.name} to delete everything in it for good.</span>
+					<button
+						type="button"
+						class="btn-tactile !h-7 shrink-0 !px-2.5 !text-[12px] hover:!text-[var(--z-ch-discard-ink)] max-md:!h-11 max-md:!px-3.5 max-md:!text-[13px]"
+						disabled={busy}
+						onclick={onEmpty}
+					>
+						Empty {mailbox.name}
+					</button>
+				</div>
+			{/if}
+			{#if searchQuery && onSearchAll}
+				<div class="flex items-center gap-2 pt-3">
+					<span class="z-caption">Search in</span>
+					<div class="z-group min-w-0" role="group" aria-label="Search in">
+						<button type="button" class="z-segment !h-6 max-w-[160px] truncate !px-2.5 max-md:!h-10 max-md:!px-3.5" aria-pressed={!searchAll} onclick={() => onSearchAll(false)}>
+							{mailbox?.name ?? 'This folder'}
+						</button>
+						<button type="button" class="z-segment !h-6 shrink-0 !px-2.5 max-md:!h-10 max-md:!px-3.5" aria-pressed={searchAll} onclick={() => onSearchAll(true)}>
+							All folders
+						</button>
+					</div>
+				</div>
+			{/if}
+			{#each groups as group (group.label)}
+				<!-- Group divider: stays put while its own rows scroll under it. -->
+				<div
+					class="sticky top-0 z-[5] -mx-3.5 flex items-center gap-2.5 bg-[color-mix(in_oklab,var(--z-surface)_95%,transparent)] px-3.5 pt-3 pb-[5px] backdrop-blur max-md:-mx-3 max-md:px-3"
+					aria-hidden="true"
+				>
+					<span class="z-caption">{group.label}</span>
+					<span class="h-px flex-1 bg-[var(--z-hairline)]"></span>
+					<span class="z-mono text-[11px] font-semibold text-[var(--z-soft)] max-md:text-[12px]">{group.rows.length}</span>
+				</div>
+
+				<!-- The 3px above are for a first row's ring (selected, or the cursor's), which the divider would otherwise cover. -->
+				<div class="flex flex-col gap-2 pt-[3px] pb-2" role="list" aria-label={group.label}>
+					{#each group.rows as row (row.threadId)}
+						{@const isCursor = row.threadId === cursorId}
+						{@const isOpen = row.threadId === openThreadId}
+						{@const isSelected = selection.has(row.threadId)}
+						{@const channel = rowChannel(row)}
+						<!--
+							Four states, in rank: ticked wears the correspondence selection; open
+							wears its channel's wash with a ring; the keyboard cursor is the focus
+							ring over whatever the row already wears; rest is the channel's own
+							colour. The row takes a click anywhere on it; the keyboard and a screen
+							reader have the button inside it, which a click on the text lands on too.
+						-->
+						<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+						<div
+							data-row-id={row.threadId}
+							data-state={isSelected ? 'selected' : isOpen ? 'open' : isCursor ? 'cursor' : 'rest'}
+							data-unread={row.unread ? 'true' : 'false'}
+							class="z-row z-railed group/row grid cursor-pointer items-start gap-x-[11px] rounded-[10px] border py-3 pr-3 pl-[18px] max-md:gap-x-1 max-md:py-2.5 max-md:pr-2.5 max-md:pl-2 {prefs.showAvatars
+								? 'grid-cols-[18px_30px_minmax(0,1fr)] max-md:grid-cols-[32px_30px_minmax(0,1fr)]'
+								: 'grid-cols-[18px_minmax(0,1fr)] max-md:grid-cols-[32px_minmax(0,1fr)]'}"
+							class:z-hue-wash={row.unread && !isSelected && !isOpen}
+							style="{channelStyle(channel)};--z-rail-inset:12px"
+							onclick={() => onOpen(row.threadId)}
+							draggable={viewport.compact ? undefined : true}
+							ondragstart={(event) => event.dataTransfer?.setData('text/x-zaur-thread', row.threadId)}
+							role="listitem"
+						>
+							<!--
+								Selection checkbox. On a phone the drawn box stays 18px and the
+								button grows to 44px, which is the target a thumb can actually hit;
+								it spills 6px past its 32px column each side, so the target does not
+								cost the subject line its width.
+							-->
+							<button
+								type="button"
+								class="flex size-[18px] items-center justify-center self-center max-md:-mx-1.5 max-md:size-11"
+								role="checkbox"
+								aria-checked={isSelected}
+								aria-label="Select conversation from {row.senderLabel}"
+								title={isSelected ? 'Deselect (x)' : 'Select (x)'}
+								tabindex={-1}
+								onclick={(event) => {
+									event.stopPropagation();
+									onToggleSelect(row.threadId);
+								}}
+							>
+								<span class="hobday-checkbox" data-checked={isSelected} aria-hidden="true"></span>
+							</button>
+
+							<!-- The person: their identity tile, the same tone everywhere they
+							     appear. Off by default — see `showAvatars`; the row's rail still
+							     carries the channel, and the grid drops the column with it. -->
+							{#if prefs.showAvatars}
+								<span class="z-avatar self-center" style={identityStyle(row.senderEmail || row.senderLabel)} aria-hidden="true">
+									{initials(row.senderLabel, row.senderEmail)}
+								</span>
+							{/if}
+
+							<!-- No click handler of its own: the click goes on to the row's. -->
+							<button
+								type="button"
+								class="z-row-open block min-w-0 cursor-pointer text-left"
+								tabindex={row.threadId === focusId ? 0 : -1}
+								aria-label={rowLabel(row)}
+								aria-current={isOpen ? 'true' : undefined}
+							>
+								<span class="grid grid-cols-[minmax(0,1fr)_auto] items-baseline gap-x-2" aria-hidden="true">
+									<span class="flex min-w-0 items-baseline gap-[7px]">
+										<span class="truncate text-[13px] {row.unread ? 'font-bold text-[var(--z-ink)]' : 'font-medium text-[var(--z-muted)]'}">
+											{row.senderLabel}
+										</span>
+										<!-- A chip names state the message carries, or the category a rule or the classifier gave it; the row's channel colours it. -->
+										{#if row.starred || row.important}
+											<span class="z-chip @max-[430px]:hidden">{row.starred ? 'Flagged' : 'Important'}</span>
+										{:else if row.category && row.category !== CATEGORY_OTHER}
+											<span class="z-chip @max-[430px]:hidden">{categoryLabel(row.category)}</span>
+										{/if}
+										{#if row.messageCount > 1}
+											<span class="z-chip z-chip-filled !tracking-normal !normal-case max-md:!text-[12px]" title="{row.messageCount} messages in this conversation">
+												{row.messageCount}
+											</span>
+										{/if}
+									</span>
+
+									<!-- Indicators only — the buttons that act on them are in the
+									     hover strip, which takes over exactly this slot. -->
+									<span class="z-row-meta flex shrink-0 items-center gap-1.5">
+										{#if row.hasAttachment}
+											<ActionIcon name="clip" class="size-3.5 shrink-0 text-[var(--z-faint)]" label="Has attachment" />
+										{/if}
+										<time
+											class="z-mono text-[11px] max-md:text-[12px] {row.unread && !isSelected && !isOpen ? 'font-semibold text-[var(--z-strong)]' : isSelected || isOpen ? 'font-medium text-[var(--z-muted)]' : 'font-medium text-[var(--z-soft)]'}"
+											datetime={row.receivedAt}
+										>
+											{formatListTime(row.receivedAt)}
+										</time>
+									</span>
+								</span>
+
+								<span class="mt-[3px] block truncate text-[14px] leading-snug tracking-[-0.01em] {row.unread ? 'font-semibold text-[var(--z-ink)]' : 'font-normal text-[var(--z-strong)]'}" aria-hidden="true">
+									{row.subject}
+								</span>
+
+								{#if prefs.showPreview}
+									<span class="mt-0.5 block truncate text-[12.5px] leading-[1.6] text-[var(--z-muted)]" aria-hidden="true">
+										{row.preview}
+									</span>
+								{/if}
+							</button>
+
+							<!--
+								Hover actions: one card, quiet items. Pointer-only, and out of
+								the tab order — 50 rows × 4 stops is not a tab order. The
+								keyboard has s / e / # on the cursor row, and every one of
+								these is in the selection header too.
+							-->
+							<div class="z-row-actions z-group absolute top-[5px] right-[7px] !p-[3px] !shadow-[var(--z-shadow-menu)]">
+								<button
+									type="button"
+									tabindex="-1"
+									class="z-icon-btn {row.starred ? '!text-[var(--z-ch-flagged-solid)] hover:!bg-[var(--z-ch-flagged-hover)]' : ''}"
+									aria-label={row.starred ? 'Remove flag' : 'Flag'}
+									aria-pressed={row.starred}
+									title={row.starred ? 'Remove flag (s)' : 'Flag (s)'}
+									onclick={(event) => rowAction(event, row.threadId, row.starred ? 'unstar' : 'star')}
+								>
+									<ActionIcon name={row.starred ? 'flag-filled' : 'flag'} class="size-[15px]" />
+								</button>
+								<button
+									type="button"
+									tabindex="-1"
+									class="z-icon-btn {row.important ? '!text-[var(--z-ch-needs-solid)] hover:!bg-[var(--z-ch-needs-fill)]' : ''}"
+									aria-label={row.important ? 'Not important' : 'Mark important'}
+									aria-pressed={row.important}
+									title={row.important ? 'Not important (i)' : 'Mark important (i)'}
+									onclick={(event) => rowAction(event, row.threadId, row.important ? 'unimportant' : 'important')}
+								>
+									<ActionIcon name={row.important ? 'important-filled' : 'important'} class="size-[15px]" />
+								</button>
+								<button
+									type="button"
+									tabindex="-1"
+									class="z-icon-btn"
+									aria-label={row.unread ? 'Mark read' : 'Mark unread'}
+									title={row.unread ? 'Mark read' : 'Mark unread'}
+									onclick={(event) => rowAction(event, row.threadId, row.unread ? 'read' : 'unread')}
+								>
+									<ActionIcon name={row.unread ? 'mail-open' : 'mail'} class="size-[15px]" />
+								</button>
+								{#if archiveTarget}
+									<button type="button" tabindex="-1" class="z-icon-btn" aria-label="Archive" title="Archive (e)" onclick={(event) => rowAction(event, row.threadId, 'move', archiveTarget.id)}>
+										<ActionIcon name="archive" class="size-[15px]" />
+									</button>
+								{/if}
+								<button
+									type="button"
+									tabindex="-1"
+									class="z-icon-btn hover:!bg-[var(--z-ch-discard-hover)] hover:!text-[var(--z-ch-discard-solid)]"
+									aria-label={destroys ? 'Delete forever' : 'Delete'}
+									title={destroys ? 'Delete forever (#)' : 'Delete (#)'}
+									onclick={(event) => rowAction(event, row.threadId, 'delete')}
+								>
+									<ActionIcon name="trash" class="size-[15px]" />
+								</button>
+							</div>
+						</div>
+					{/each}
+				</div>
+			{/each}
+			{#if hasMore && onLoadMore}
+				<div class="flex justify-center pt-1 pb-2" {@attach nearEnd}>
+					<button type="button" class="btn-tactile !h-8 max-md:!h-11 max-md:!px-5" disabled={loading} onclick={onLoadMore}>
+						{loading ? 'Loading…' : 'Load more'}
+					</button>
+				</div>
+			{/if}
+		{/if}
+	</div>
+</section>
+
+<style>
+	/*
+	 * A row is a card wearing its channel: the rail is the channel's solid, and
+	 * unread adds the channel's fill and stroke. Read rows go white with the
+	 * rail at a third strength. A ticked row is the correspondence solid whatever
+	 * the channel; the open row wears its own channel, as the design's does.
+	 */
+	.z-row {
+		transition:
+			background-color 120ms ease,
+			border-color 120ms ease,
+			box-shadow 120ms ease;
+	}
+
+	/*
+	 * Scoped styles are unlayered and `.z-hue-wash` lives in `@layer base`, so a
+	 * plain `.z-row { background: #fff }` here would silently beat the shared
+	 * wash and flatten every unread row. Claim the default only when the wash is
+	 * not on the element; the state rules below still outrank both.
+	 */
+	.z-row:not(.z-hue-wash) {
+		background: var(--z-surface);
+		border-color: var(--z-hairline);
+	}
+
+	.z-row[data-unread='false'] {
+		--z-rail-strength: 0.34;
+	}
+
+	.z-row[data-unread='true'] {
+		box-shadow: var(--z-shadow-raised);
+	}
+
+	/*
+	 * The keyboard cursor is the focus ring, drawn whether or not the row holds
+	 * DOM focus (j / k from the reader move it too). A ring, not a fill: the
+	 * whisper of blue it was read as the unread inbox wash's twin.
+	 */
+	.z-row[data-state='cursor'],
+	.z-row:has(.z-row-open:focus-visible) {
+		outline: 2px solid var(--z-accent);
+		outline-offset: 1px;
+	}
+
+	.z-row-open:focus-visible {
+		outline: none;
+	}
+
+	/*
+	 * Text on a channel's wash takes the channel's ink rather than slate: grey
+	 * on amber or violet reads as dirt. Every text tone in the row reads these.
+	 */
+	.z-row.z-hue-wash,
+	.z-row[data-state='open'] {
+		--z-strong: color-mix(in oklab, var(--z-ink-on) 90%, var(--z-ink));
+		--z-muted: color-mix(in oklab, var(--z-ink-on) 85%, var(--z-fill));
+		--z-soft: color-mix(in oklab, var(--z-ink-on) 76%, var(--z-fill));
+		--z-faint: color-mix(in oklab, var(--z-ink-on) 55%, var(--z-fill));
+	}
+
+	.z-row[data-state='selected'] {
+		background: var(--z-accent-tint);
+		border-color: var(--z-accent);
+		box-shadow: 0 0 0 1px var(--z-accent);
+	}
+
+	/* The open thread keeps its colour: the channel's wash, a full rail and a
+	   ring in its own stroke, so row and reader card read as one hue. */
+	.z-row[data-state='open'] {
+		--z-rail-strength: 1;
+		background: var(--z-fill);
+		border-color: var(--z-stroke);
+		box-shadow: 0 0 0 1px var(--z-stroke);
+	}
+
+	.z-row-actions {
+		opacity: 0;
+		pointer-events: none;
+		transition: opacity 120ms ease;
+	}
+
+	.z-row-meta {
+		transition: opacity 120ms ease;
+	}
+
+	@media (prefers-reduced-motion: no-preference) {
+		.z-bulk {
+			animation: z-bulk-in 140ms ease-out;
+		}
+	}
+
+	@keyframes z-bulk-in {
+		from {
+			opacity: 0;
+			transform: translateY(-3px);
+		}
+	}
+
+	@media (hover: hover) {
+		.z-row[data-state='rest']:not(.z-hue-wash):hover {
+			border-color: var(--z-line);
+			box-shadow: var(--z-shadow-raised);
+		}
+
+		/* One slot, two states: the time steps out, the buttons step in. */
+		.z-row:hover .z-row-actions {
+			opacity: 1;
+			pointer-events: auto;
+		}
+
+		.z-row:hover .z-row-meta {
+			opacity: 0;
+		}
+	}
+
+	/* Phone layout has no hover strip: a tap would stick it open over the time,
+	   and the actions already live in the bar. A narrow window is that layout. */
+	@media (hover: none), (max-width: 767px) {
+		.z-row-actions {
+			display: none;
+		}
+	}
+</style>

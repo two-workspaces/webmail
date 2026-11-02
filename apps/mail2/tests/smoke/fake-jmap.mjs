@@ -1,0 +1,1093 @@
+// A tiny in-memory JMAP server speaking just enough of Stalwart's dialect to
+// exercise mail2's remote functions end to end: session, mailboxes, contacts
+// (RFC 9610), calendars, and the urn:stalwart:jmap self-service objects.
+import http from 'node:http';
+import { randomUUID } from 'node:crypto';
+import zlib from 'node:zlib';
+
+// A second copy can run beside the shared one (FAKE_JMAP_PORT) while its own changes are tried.
+const PORT = Number(process.env.FAKE_JMAP_PORT) || 9911;
+const BASE = `http://127.0.0.1:${PORT}`;
+const ACC = 'acc1';
+const ANNA = 'acc-anna';
+// A team mailbox shared with you: its mail shows beside yours, but only its owner sends from it.
+const TEAM = 'acc-team';
+const CORE = 'urn:ietf:params:jmap:core';
+const MAIL = 'urn:ietf:params:jmap:mail';
+const CONTACTS = 'urn:ietf:params:jmap:contacts';
+const CALENDARS = 'urn:ietf:params:jmap:calendars';
+const SIEVE = 'urn:ietf:params:jmap:sieve';
+const VACATION = 'urn:ietf:params:jmap:vacationresponse';
+const FILENODE = 'urn:ietf:params:jmap:filenode';
+const STALWART = 'urn:stalwart:jmap';
+const PRINCIPALS = 'urn:ietf:params:jmap:principals';
+
+const session = {
+	username: 'smoke@zaur.app',
+	apiUrl: `${BASE}/jmap`,
+	downloadUrl: `${BASE}/jmap/download/{accountId}/{blobId}/{name}?accept={type}`,
+	uploadUrl: `${BASE}/jmap/upload/{accountId}/`,
+	eventSourceUrl: `${BASE}/jmap/eventsource/?types={types}&closeafter={closeafter}&ping={ping}`,
+	state: 's1',
+	capabilities: {
+		[CORE]: { maxObjectsInGet: 500, maxSizeUpload: 50000000 },
+		[MAIL]: {},
+		[CONTACTS]: {},
+		[CALENDARS]: {},
+		[SIEVE]: { extensions: ['fileinto', 'imap4flags'] },
+		[VACATION]: {},
+		[FILENODE]: {},
+		[STALWART]: {},
+		[PRINCIPALS]: {}
+	},
+	accounts: {
+		[ACC]: {
+			name: 'smoke@zaur.app',
+			isPersonal: true,
+			isReadOnly: false,
+			accountCapabilities: { [MAIL]: {}, [CONTACTS]: {}, [CALENDARS]: {}, [SIEVE]: {}, [VACATION]: {}, [FILENODE]: {}, [PRINCIPALS]: { currentUserPrincipalId: 'principal-smoke' } }
+		},
+		// Anna's storage, of which she has shared a folder or two with you.
+		[ANNA]: { name: 'anna@zaur.app', isPersonal: false, isReadOnly: false, accountCapabilities: { [FILENODE]: {} } },
+		[TEAM]: { name: 'team@zaur.app', isPersonal: false, isReadOnly: false, accountCapabilities: { [MAIL]: {} } }
+	},
+	primaryAccounts: { [MAIL]: ACC, [CONTACTS]: ACC, [CALENDARS]: ACC, [SIEVE]: ACC, [FILENODE]: ACC, [PRINCIPALS]: ACC }
+};
+
+const mailboxes = [
+	{ id: 'inbox', name: 'Inbox', role: 'inbox', totalEmails: 7, unreadEmails: 3, sortOrder: 0 },
+	{ id: 'drafts', name: 'Drafts', role: 'drafts', totalEmails: 1, unreadEmails: 0, sortOrder: 1 },
+	{ id: 'sent', name: 'Sent', role: 'sent', totalEmails: 1, unreadEmails: 0, sortOrder: 2 },
+	{ id: 'archive', name: 'Archive', role: 'archive', totalEmails: 1, unreadEmails: 0, sortOrder: 3 },
+	{ id: 'junk', name: 'Junk', role: 'junk', totalEmails: 1, unreadEmails: 1, sortOrder: 4 },
+	{ id: 'trash', name: 'Trash', role: 'trash', totalEmails: 0, unreadEmails: 0, sortOrder: 5 },
+	{ id: 'scheduled', name: 'Scheduled', role: 'scheduled', totalEmails: 1, unreadEmails: 0, sortOrder: 6 },
+	// Stalwart makes one of these; mail2 marks important with a keyword and does not list it.
+	{ id: 'important', name: 'Important', role: 'important', totalEmails: 0, unreadEmails: 0, sortOrder: 7 },
+	{ id: 'work', name: 'Work', role: null, parentId: null, totalEmails: 0, unreadEmails: 0, sortOrder: 10 },
+	{ id: 'receipts', name: 'Receipts', role: null, parentId: 'work', totalEmails: 0, unreadEmails: 0, sortOrder: 10 }
+];
+// An alias, so compose has a From to choose; Identity/set keeps names and signatures.
+const identities = [
+	{ id: 'id1', name: 'Smoke Tester', email: 'smoke@zaur.app', mayDelete: false, textSignature: 'Smoke Tester\nzaur.app' },
+	{ id: 'id2', name: 'Smoke Help', email: 'help@zaur.app', mayDelete: true, textSignature: '' }
+];
+let vacationResponse = { id: 'singleton', isEnabled: false, fromDate: null, toDate: null, subject: null, textBody: null, htmlBody: null };
+
+const now = Date.now();
+const at = (hoursAgo) => new Date(now - hoursAgo * 3_600_000).toISOString();
+const text = (partId, value) => ({
+	textBody: [{ partId, type: 'text/plain' }],
+	htmlBody: [],
+	bodyValues: { [partId]: { value, isTruncated: false } },
+	bodyStructure: { partId, type: 'text/plain' }
+});
+const html = (partId, value) => ({
+	textBody: [],
+	htmlBody: [{ partId, type: 'text/html' }],
+	bodyValues: { [partId]: { value, isTruncated: false } },
+	bodyStructure: { partId, type: 'text/html' }
+});
+// Attachment bytes, made here so the preview has real files to open.
+function makePdf(titles) {
+	const objs = [, '<< /Type /Catalog /Pages 2 0 R >>', `<< /Type /Pages /Kids [${titles.map((_, i) => `${4 + i * 2} 0 R`).join(' ')}] /Count ${titles.length} >>`, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'];
+	titles.forEach((title, i) => {
+		const stream = `BT /F1 28 Tf 72 700 Td (${title}) Tj ET BT /F1 12 Tf 72 660 Td (A PDF made by the smoke server, page ${i + 1} of ${titles.length}.) Tj ET`;
+		objs[4 + i * 2] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${5 + i * 2} 0 R >>`;
+		objs[5 + i * 2] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`;
+	});
+	let out = '%PDF-1.4\n';
+	const offsets = [];
+	for (let n = 1; n < objs.length; n++) {
+		offsets.push(out.length);
+		out += `${n} 0 obj\n${objs[n]}\nendobj\n`;
+	}
+	const xref = out.length;
+	out += `xref\n0 ${objs.length}\n0000000000 65535 f \n${offsets.map((o) => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}`;
+	out += `trailer\n<< /Size ${objs.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+	return Buffer.from(out, 'latin1');
+}
+function makePng(w, h) {
+	const raw = Buffer.alloc((w * 3 + 1) * h);
+	for (let y = 0; y < h; y++) {
+		for (let x = 0; x < w; x++) {
+			const i = y * (w * 3 + 1) + 1 + x * 3;
+			raw[i] = 40 + Math.round((180 * x) / w);
+			raw[i + 1] = 90 + Math.round((120 * y) / h);
+			raw[i + 2] = 200;
+		}
+	}
+	const chunk = (type, data) => {
+		const body = Buffer.concat([Buffer.from(type), data]);
+		const head = Buffer.alloc(4);
+		head.writeUInt32BE(data.length);
+		const crc = Buffer.alloc(4);
+		crc.writeUInt32BE(zlib.crc32(body));
+		return Buffer.concat([head, body, crc]);
+	};
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(w, 0);
+	ihdr.writeUInt32BE(h, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 2;
+	return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+function makeWav(seconds = 1.5, rate = 8000) {
+	const n = Math.floor(seconds * rate);
+	const data = Buffer.alloc(n * 2);
+	for (let i = 0; i < n; i++) data.writeInt16LE(Math.round(Math.sin((2 * Math.PI * 440 * i) / rate) * 8000 * (1 - i / n)), i * 2);
+	const head = Buffer.alloc(44);
+	head.write('RIFF', 0);
+	head.writeUInt32LE(36 + data.length, 4);
+	head.write('WAVEfmt ', 8);
+	head.writeUInt32LE(16, 16);
+	head.writeUInt16LE(1, 20);
+	head.writeUInt16LE(1, 22);
+	head.writeUInt32LE(rate, 24);
+	head.writeUInt32LE(rate * 2, 28);
+	head.writeUInt16LE(2, 32);
+	head.writeUInt16LE(16, 34);
+	head.write('data', 36);
+	head.writeUInt32LE(data.length, 40);
+	return Buffer.concat([head, data]);
+}
+const blobs = {
+	'blob-logo': ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="36"><rect width="120" height="36" rx="8" fill="#2563eb"/><text x="60" y="24" font-family="monospace" font-size="16" fill="#fff" text-anchor="middle">ZA/UR</text></svg>'],
+	'blob-2': ['application/pdf', makePdf(['Rotation plan', 'Timeline', 'Rollback'])],
+	'blob-3': ['text/plain', 'selector: zaur2026\nalgorithm: rsa-sha256\nkey-length: 2048\n\np=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA…\n'],
+	'blob-photo': ['image/png', makePng(960, 640)],
+	'blob-voice': ['audio/wav', makeWav()],
+	'blob-team-invoice': ['text/plain', 'Invoice 2026/09/14\nYoga mats x 12\nTotal: 1 440 PLN\n']
+};
+/** Blobs of the team mailbox: downloadable, and attachable, only as that account's. */
+const teamBlobs = new Set(['blob-team-invoice']);
+
+/** File storage: two folders (one nested), files at the top and inside. */
+const fileNode = (id, parentId, name, blobId = null) => ({
+	id, parentId, name, nodeType: blobId ? 'file' : 'directory', blobId,
+	type: blobId ? blobs[blobId][0] : null, size: blobId ? blobs[blobId][1].length : null,
+	created: '2026-09-01T09:00:00Z', modified: '2026-09-20T15:30:00Z', role: null,
+	myRights: { mayRead: true, mayAddChildren: true, mayRename: true, mayDelete: true, mayModifyContent: true, mayShare: true }
+});
+const fileNodes = [
+	fileNode('fn-docs', null, 'Documents'),
+	fileNode('fn-work', null, 'Work'),
+	fileNode('fn-contracts', 'fn-work', 'Contracts'),
+	fileNode('fn-plan', null, 'rotation-plan.pdf', 'blob-2'),
+	fileNode('fn-logo', null, 'logo.svg', 'blob-logo'),
+	fileNode('fn-dkim', 'fn-docs', 'dkim.txt', 'blob-3'),
+	fileNode('fn-photo', 'fn-contracts', 'studio.png', 'blob-photo')
+];
+// What you can see of Anna's: two folders whose parent (her home) you cannot,
+// one to read and one to write into.
+const readOnly = { mayRead: true, mayAddChildren: false, mayRename: false, mayDelete: false, mayModifyContent: false, mayShare: false };
+const writable = { ...readOnly, mayAddChildren: true, mayRename: true, mayModifyContent: true };
+const annaFileNodes = [
+	{ ...fileNode('fa-handbook', 'fa-home', 'Team handbook'), myRights: readOnly },
+	{ ...fileNode('fa-onboarding', 'fa-handbook', 'onboarding.pdf', 'blob-2'), myRights: readOnly },
+	{ ...fileNode('fa-drafts', 'fa-home', 'Shared drafts'), myRights: writable },
+	{ ...fileNode('fa-notes', 'fa-drafts', 'meeting-notes.txt', 'blob-3'), myRights: writable }
+];
+const nodesOf = (accountId) => (accountId === ANNA ? annaFileNodes : fileNodes);
+
+/**
+ * Delayed sends (created with a `holdfor`) still waiting to go out. m10, the
+ * sample in Scheduled, is not one: it has gone out and waits to be filed to Sent.
+ */
+const pendingSends = new Set();
+/** Sample mail: every channel, a thread, an attachment, one of each state. */
+const emails = new Map(
+	[
+		{
+			id: 'm1', threadId: 't1', mailboxIds: { inbox: true }, keywords: {},
+			from: [{ name: 'Stalwart Ops', email: 'ops@zaur.app' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: 'Re: DKIM rotation for mail.zaur.app', receivedAt: at(1), hasAttachment: true,
+			preview: 'The new selector is live. Signing switched over at 09:31 UTC and the first outbound batch verified clean…',
+			...text('1', 'The new selector is live on mail.zaur.app. Signing switched over at 09:31 UTC and the first outbound batch verified clean against both Google and Outlook.\n\nThe old key stays published until the 30th so anything still in flight verifies. After that I’ll drop the record and we’re down to one selector again.\n\n— Ops'),
+			bodyStructure: {
+				type: 'multipart/mixed',
+				subParts: [
+					{ partId: '1', type: 'text/plain' },
+					{ partId: '2', blobId: 'blob-2', type: 'application/pdf', name: 'rotation-plan.pdf', size: 131072, disposition: 'attachment' },
+					{ partId: '3', blobId: 'blob-3', type: 'text/plain', name: 'dkim-selector-2026.txt', size: 4096, disposition: 'attachment' }
+				]
+			}
+		},
+		{
+			id: 'm0', threadId: 't1', mailboxIds: { inbox: true }, keywords: { $seen: true },
+			from: [{ name: 'Annie Hobday', email: 'annie@example.com' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: 'Re: DKIM rotation for mail.zaur.app', receivedAt: at(20), hasAttachment: false,
+			preview: 'Works for me — I’ll watch the postmaster reports on Monday afternoon.',
+			...text('1', 'Works for me — I’ll watch the postmaster reports on Monday afternoon.')
+		},
+		{
+			id: 'm2', threadId: 't2', mailboxIds: { inbox: true }, keywords: { $important: true },
+			from: [{ name: 'Annie Hobday', email: 'annie@example.com' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: 'Design handoff — reader spacing', receivedAt: at(2.5), hasAttachment: false,
+			preview: 'Waiting on your call about the 680px measure before I redraw.',
+			...text('1', 'Waiting on your call about the 680px measure before I redraw.')
+		},
+		{
+			id: 'm3', threadId: 't3', mailboxIds: { inbox: true }, keywords: { $seen: true, $flagged: true },
+			from: [{ name: 'Marek Lis', email: 'marek@example.org' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: 'JMAP push quirks on reconnect', receivedAt: at(3), hasAttachment: false,
+			preview: 'Kept the thread so you have the history before Thursday.',
+			...text('1', 'Kept the thread so you have the history before Thursday.')
+		},
+		{
+			// A receipt: categorised at delivery, so the row wears the confirmed hue.
+			id: 'm11', threadId: 't11', mailboxIds: { inbox: true }, keywords: { $seen: true, 'cat.receipts': true },
+			from: [{ name: 'Acme Store', email: 'orders@acme.example' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: 'Your order has shipped', receivedAt: at(3), hasAttachment: false,
+			preview: 'Order #48213 is on its way. Tracking number 1Z 999 AA1 01 2345 6784.',
+			...text('1', 'Order #48213 is on its way.\nTracking number 1Z 999 AA1 01 2345 6784.')
+		},
+		{
+			id: 'm4', threadId: 't4', mailboxIds: { inbox: true }, keywords: { $seen: true, 'cat.notifications': true },
+			from: [{ name: 'Dokploy', email: 'deploys@dokploy.example' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: 'Deployment succeeded — mail2', receivedAt: at(4), hasAttachment: false,
+			preview: 'Build 482 pushed to mail2.zaur.app in 2m 14s.',
+			...html('1', '<div style="font-family:Arial,sans-serif;max-width:560px"><h2 style="color:#1f2937;margin:0 0 8px">Deployment succeeded</h2><p style="color:#374151">Build <strong>482</strong> pushed to <a href="https://mail2.zaur.app">mail2.zaur.app</a> in 2m 14s.</p><table style="border-collapse:collapse;font-size:13px"><tr><td style="padding:4px 12px 4px 0;color:#6b7280">Commit</td><td><code>2030cba</code></td></tr><tr><td style="padding:4px 12px 4px 0;color:#6b7280">Duration</td><td>2m 14s</td></tr></table></div>')
+		},
+		{
+			id: 'm5', threadId: 't5', mailboxIds: { inbox: true }, keywords: { $seen: true, 'cat.notifications': true },
+			from: [{ name: 'GitHub', email: 'noreply@github.example' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: 'All checks have passed on main', receivedAt: at(30), hasAttachment: false,
+			preview: '3 workflows completed successfully for commit 2030cba.',
+			...text('1', '3 workflows completed successfully for commit 2030cba.')
+		},
+		{
+			id: 'm6', threadId: 't6', mailboxIds: { sent: true }, keywords: { $seen: true },
+			from: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }], to: [{ name: 'Annie Hobday', email: 'annie@example.com' }],
+			subject: 'Reader spacing — decision', receivedAt: at(26), hasAttachment: false,
+			preview: 'Left-aligned at 680px. Holds up much better than centring.',
+			...text('1', 'Left-aligned at 680px. Holds up much better than centring.')
+		},
+		{
+			id: 'm7', threadId: 't7', mailboxIds: { junk: true }, keywords: {},
+			from: [{ name: 'Prize Desk', email: 'win@example.net' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: 'You have been selected', receivedAt: at(5), hasAttachment: false,
+			preview: 'Claim within 24 hours.',
+			...text('1', 'Claim within 24 hours.')
+		},
+		{
+			// A remote image (blocked until asked for) and an inline cid: one (always shown).
+			id: 'm8', threadId: 't8', mailboxIds: { inbox: true }, keywords: { 'cat.newsletters': true },
+			from: [{ name: 'Newsletter', email: 'news@example.com' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: 'This week at the studio', receivedAt: at(0.5), hasAttachment: true,
+			preview: 'Our logo, and a picture from somewhere else.',
+			...html('1', '<p>Our logo, sent with the message:</p><p><img src="cid:logo@zaur" alt="Studio logo"></p><p>And a picture from somewhere else:</p><p><img src="https://example.com/pixel.png" alt="Remote picture" width="120" height="40"></p>'),
+			bodyStructure: {
+				type: 'multipart/mixed',
+				subParts: [
+					{
+						type: 'multipart/related',
+						subParts: [
+							{ partId: '1', type: 'text/html' },
+							{ partId: '2', blobId: 'blob-logo', type: 'image/svg+xml', name: 'logo.svg', cid: '<logo@zaur>', disposition: 'inline', size: 200 }
+						]
+					},
+					{ partId: '3', blobId: 'blob-photo', type: 'image/png', name: 'studio.png', size: blobs['blob-photo'][1].length, disposition: 'attachment' },
+					{ partId: '4', blobId: 'blob-voice', type: 'audio/wav', name: 'voice-note.wav', size: blobs['blob-voice'][1].length, disposition: 'attachment' }
+				]
+			}
+		},
+		{
+			// Webmail 1.0's settings carrier: never shown as mail. Its signature is
+			// copied onto identities without one (help@) on the first identities load.
+			id: 'm9', threadId: 't9', mailboxIds: { archive: true }, keywords: { $seen: true },
+			from: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }], to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			subject: '__zaur_webmail_settings_v1__', receivedAt: at(40), hasAttachment: false,
+			preview: '{}',
+			...text('1', JSON.stringify({ version: 2, updatedAt: at(40), settings: { 'zaur:signature:smoke@zaur.app': 'Signed in 1.0\nwebmail.zaur.app' } }))
+		},
+		{
+			// Sent already (its submission is final), still in Scheduled until a client files it.
+			id: 'm10', threadId: 't10', mailboxIds: { scheduled: true }, keywords: { $seen: true },
+			from: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }], to: [{ name: 'Annie Hobday', email: 'annie@example.com' }],
+			subject: 'Weekly notes', receivedAt: at(6), hasAttachment: false,
+			preview: 'Went out this morning.', ...text('1', 'Went out this morning.')
+		},
+		{
+			// A draft another client saved. Opened in compose, only its inline (cid:) image may
+			// load: the editor is the app's own page, so the rest would be fetched with the
+			// reader's cookies. `draft-probe` names every address that must never be asked for:
+			// the planted link is one too, since the app's router follows a click on it.
+			id: 'm12', threadId: 't12', mailboxIds: { drafts: true }, keywords: { $seen: true, $draft: true },
+			from: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			// The same address twice, as another client may save it: compose shows one chip.
+			to: [{ name: 'Annie Hobday', email: 'annie@example.com' }, { email: 'ANNIE@example.com' }],
+			subject: 'Started in another client', receivedAt: at(3), hasAttachment: false,
+			preview: 'Started elsewhere.',
+			...html('1', '<style>@import url("https://example.com/draft-probe.css");</style><div>Started elsewhere.<br><img src="cid:logo@zaur" alt="logo"><img src="https://example.com/draft-probe.png" width="1" height="1"><img src="/api/download?blobId=draft-probe"><img srcset="/api/download?blobId=draft-probe-set 2x"><figure data-trix-attachment=\'{"contentType":"image/png","url":"/api/download?blobId=draft-probe-trix"}\'></figure><figure data-trix-attachment=\'{"contentType":"text/html","content":"&lt;img src=/api/download?blobId=draft-probe-content&gt;"}\'></figure><video poster="https://example.com/draft-probe-poster.png"></video><div style="background:url(https://example.com/draft-probe-bg.png)">End.</div><a href="/oidc/logout?draft-probe">planted link</a> <a href="https://example.org/">outside link</a></div>'),
+			bodyStructure: {
+				type: 'multipart/related',
+				subParts: [
+					{ partId: '1', type: 'text/html' },
+					{ partId: '2', blobId: 'blob-logo', type: 'image/svg+xml', name: 'logo.svg', cid: '<logo@zaur>', disposition: 'inline', size: 200 }
+				]
+			}
+		},
+		{
+			// A sender that asks for answers elsewhere: Reply goes to Reply-To, not From.
+			id: 'm14', threadId: 't14', mailboxIds: { inbox: true }, keywords: { $seen: true },
+			from: [{ name: 'Shop Robot', email: 'noreply@shop.example' }], replyTo: [{ name: 'Shop Support', email: 'support@shop.example' }],
+			to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }, { name: 'Ada Lovelace', email: 'ada@example.com' }],
+			cc: [{ name: 'Grace Hopper', email: 'grace@example.com' }],
+			subject: 'Your order has a Reply-To', receivedAt: at(28), hasAttachment: false,
+			preview: 'Answers to this address are not read; write to support.',
+			references: ['order-1@shop.example'], inReplyTo: ['order-1@shop.example'],
+			...text('1', 'Answers to this address are not read; write to support.')
+		},
+		{
+			// Mine, to two people: a plain Reply is a follow-up to them, not a letter to me.
+			id: 'm15', threadId: 't15', mailboxIds: { sent: true }, keywords: { $seen: true },
+			from: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+			to: [{ name: 'Annie Hobday', email: 'annie@example.com' }, { name: 'Ada Lovelace', email: 'ada@example.com' }],
+			cc: [{ name: 'Grace Hopper', email: 'grace@example.com' }],
+			subject: 'Sent to two, with a Cc', receivedAt: at(27), hasAttachment: false,
+			preview: 'A message of my own.',
+			...text('1', 'A message of my own.')
+		}
+	].map((email) => [email.id, email])
+);
+
+const addressBooks = [
+	{ id: 'ab1', name: 'Personal', isDefault: true, isSubscribed: true, myRights: { mayRead: true, mayWrite: true, mayDelete: true } }
+];
+const cards = new Map([
+	[
+		'c1',
+		{
+			id: 'c1',
+			addressBookIds: { ab1: true },
+			uid: 'urn:uuid:c1',
+			kind: 'individual',
+			name: { components: [{ kind: 'given', value: 'Ada' }, { kind: 'surname', value: 'Lovelace' }] },
+			emails: { e1: { address: 'ada@example.com', contexts: { work: true }, pref: 1 } },
+			organizations: { o1: { name: 'Analytical Engines' } },
+			updated: '2026-09-01T10:00:00Z'
+		}
+	],
+	[
+		'c2',
+		{
+			id: 'c2',
+			addressBookIds: { ab1: true },
+			uid: 'urn:uuid:c2',
+			name: { components: [{ kind: 'given', value: 'Grace' }, { kind: 'surname', value: 'Hopper' }] },
+			emails: { e1: { address: 'grace@example.com' } },
+			phones: { p1: { number: '+1 555 0100', features: { mobile: true } } },
+			notes: { n1: { note: 'Prefers email.' } }
+		}
+	],
+	[
+		'c3',
+		{
+			id: 'c3',
+			addressBookIds: { ab1: true },
+			uid: 'urn:uuid:c3',
+			organizations: { o1: { name: '42 Ltd' } },
+			emails: { e1: { address: 'hello@42.example' } }
+		}
+	]
+]);
+
+const calendars = [
+	{ id: 'cal1', name: 'Personal', color: '#2563eb', isDefault: true, isVisible: true, isSubscribed: true, sortOrder: 0, myRights: { mayReadItems: true, mayWriteAll: true, mayWriteOwn: true, mayRSVP: true, mayShare: true, mayDelete: true, mayReadFreeBusy: true, mayUpdatePrivate: true } },
+	{ id: 'cal2', name: 'Work', color: '#16a34a', isDefault: false, isVisible: true, isSubscribed: true, sortOrder: 1, shareWith: { 'principal-anna': { mayReadItems: true, mayWriteAll: false, mayWriteOwn: false, mayRSVP: true, mayShare: false, mayDelete: false, mayReadFreeBusy: true, mayUpdatePrivate: false } }, myRights: { mayReadItems: true, mayWriteAll: true, mayWriteOwn: true, mayRSVP: true, mayShare: true, mayDelete: true, mayReadFreeBusy: true, mayUpdatePrivate: true } },
+	{ id: 'cal3', name: 'PL Holidays', color: '#d97706', isDefault: false, isVisible: true, isSubscribed: true, sortOrder: 2, myRights: { mayReadItems: true, mayWriteAll: false, mayWriteOwn: false, mayRSVP: false, mayShare: false, mayDelete: false, mayReadFreeBusy: true, mayUpdatePrivate: false } }
+];
+const teamMailboxes = [
+	{ id: 'team-inbox', name: 'Inbox', role: 'inbox', totalEmails: 2, unreadEmails: 1, sortOrder: 0 },
+	{ id: 'team-sent', name: 'Sent', role: 'sent', totalEmails: 0, unreadEmails: 0, sortOrder: 2 },
+	{ id: 'team-archive', name: 'Archive', role: 'archive', totalEmails: 0, unreadEmails: 0, sortOrder: 3 },
+	{ id: 'team-trash', name: 'Trash', role: 'trash', totalEmails: 0, unreadEmails: 0, sortOrder: 5 }
+];
+const teamEmails = new Map(
+	[
+		{
+			id: 'tm1', threadId: 'tt1', mailboxIds: { 'team-inbox': true }, keywords: {},
+			from: [{ name: 'Ola Nowak', email: 'ola@example.com' }], to: [{ name: '', email: 'team@zaur.app' }],
+			subject: 'Invoice for the September mats', receivedAt: at(0.5), hasAttachment: true,
+			preview: 'Hello, the invoice for the yoga mats is attached.',
+			...text('1', 'Hello, the invoice for the yoga mats is attached. Could you confirm the delivery address?\n\nOla'),
+			bodyStructure: {
+				type: 'multipart/mixed',
+				subParts: [
+					{ partId: '1', type: 'text/plain' },
+					{ partId: '2', blobId: 'blob-team-invoice', type: 'text/plain', name: 'invoice.txt', size: blobs['blob-team-invoice'][1].length, disposition: 'attachment' }
+				]
+			}
+		},
+		{
+			id: 'tm2', threadId: 'tt2', mailboxIds: { 'team-inbox': true }, keywords: { $seen: true },
+			from: [{ name: 'Studio Kraków', email: 'studio@example.org' }], to: [{ name: '', email: 'team@zaur.app' }],
+			subject: 'Saturday class moved to 10:00', receivedAt: at(5), hasAttachment: false,
+			preview: 'The Saturday class starts an hour later this week.',
+			...text('1', 'The Saturday class starts an hour later this week.')
+		}
+	].map((email) => [email.id, email])
+);
+
+// Every message has a Message-ID: what a reply's In-Reply-To and References are built from.
+for (const email of [...emails.values(), ...teamEmails.values()]) email.messageId ??= [`${email.id}@smoke.example`];
+
+/** Sieve scripts (RFC 9661): none to begin with; Settings → Rules saves one. */
+const sieveScripts = [];
+
+// The people a calendar can be shared with (RFC 9670 Principals), you among them.
+const principals = [
+	{ id: 'principal-smoke', type: 'individual', name: 'Smoke Tester', email: 'smoke@zaur.app' },
+	{ id: 'principal-anna', type: 'individual', name: 'Anna Nowak', email: 'anna@zaur.app' },
+	{ id: 'principal-bob', type: 'individual', name: 'Bob Kowalski', email: 'bob@zaur.app' },
+	{ id: 'principal-bobby', type: 'individual', name: 'Bobby Tables', email: 'bobby@zaur.app' }
+];
+const today = new Date();
+const y = today.getFullYear();
+const m = String(today.getMonth() + 1).padStart(2, '0');
+/** Anchored to today, so the day and week views always have something in them. */
+const slot = (offsetDays, hours, minutes = 0) => {
+	const when = new Date(today.getFullYear(), today.getMonth(), today.getDate() + offsetDays, hours, minutes);
+	return `${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, '0')}-${String(when.getDate()).padStart(2, '0')}T${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}:00`;
+};
+const events = new Map([
+	['e1', { id: 'e1', uid: 'urn:uuid:e1', calendarIds: { cal1: true }, title: 'Dentist', start: `${y}-${m}-16T09:30:00`, duration: 'PT1H', timeZone: 'Europe/Warsaw', showWithoutTime: false, locations: { l1: { name: 'ul. Długa 5' } } }],
+	['e2', { id: 'e2', uid: 'urn:uuid:e2', calendarIds: { cal2: true }, title: 'Sprint planning', start: `${y}-${m}-16T14:00:00`, duration: 'PT2H', timeZone: 'Europe/Warsaw', showWithoutTime: false, description: 'Bring the backlog.', recurrenceRule: { '@type': 'RecurrenceRule', frequency: 'weekly' } }],
+	['e3', { id: 'e3', uid: 'urn:uuid:e3', calendarIds: { cal1: true }, title: 'Holiday', start: `${y}-${m}-20T00:00:00`, duration: 'P2D', timeZone: 'Europe/Warsaw', showWithoutTime: true }],
+	// Three that overlap, so the time grid has lanes to share out.
+	['e4', { id: 'e4', uid: 'urn:uuid:e4', calendarIds: { cal2: true }, title: 'Design review', start: slot(0, 10, 0), duration: 'PT1H30M', timeZone: 'Europe/Warsaw', showWithoutTime: false, participants: { p1: { '@type': 'Participant', name: 'Anna Nowak', email: 'anna@zaur.app', sendTo: { imip: 'mailto:anna@zaur.app' }, roles: { owner: true, attendee: true }, participationStatus: 'accepted' }, p2: { '@type': 'Participant', name: 'Smoke Tester', sendTo: { imip: 'mailto:smoke@zaur.app' }, roles: { attendee: true }, participationStatus: 'tentative' }, p3: { '@type': 'Participant', calendarAddress: 'mailto:a-rather-long-address-for-a-guest@subdomain.example.com', roles: { attendee: true } }, p4: { '@type': 'Participant', name: 'Bob Kowalski', email: 'bob@zaur.app', roles: { attendee: true }, participationStatus: 'declined' } } }],
+	['e5', { id: 'e5', uid: 'urn:uuid:e5', calendarIds: { cal1: true }, title: 'Call with Anna', start: slot(0, 10, 30), duration: 'PT1H', timeZone: 'Europe/Warsaw', showWithoutTime: false, locations: { l1: { name: 'Meet' } } }],
+	['e6', { id: 'e6', uid: 'urn:uuid:e6', calendarIds: { cal2: true }, title: 'Standup', start: slot(0, 9, 0), duration: 'PT15M', timeZone: 'Europe/Warsaw', showWithoutTime: false }],
+	['e7', { id: 'e7', uid: 'urn:uuid:e7', calendarIds: { cal1: true }, title: 'Pick up the kids', start: slot(1, 15, 30), duration: 'PT45M', timeZone: 'Europe/Warsaw', showWithoutTime: false }],
+	['e8', { id: 'e8', uid: 'urn:uuid:e8', calendarIds: { cal2: true }, title: 'Deploy window', start: slot(-1, 22, 0), duration: 'PT5H', timeZone: 'Europe/Warsaw', showWithoutTime: false }],
+	['e9', { id: 'e9', uid: 'urn:uuid:e9', calendarIds: { cal3: true }, title: 'Independence Day', start: slot(2, 0, 0), duration: 'P1D', timeZone: 'Europe/Warsaw', showWithoutTime: true }]
+]);
+
+let totpUrl = null;
+const appPasswords = new Map([[ 'ap1', { id: 'ap1', description: 'Thunderbird', createdAt: '2026-08-01T00:00:00Z', allowedIps: {} } ]]);
+const apiKeys = new Map();
+
+const log = (...args) => console.log(new Date().toISOString().slice(11, 19), ...args);
+
+// Mail arriving: POST /smoke/deliver adds an unseen inbox message, moves the
+// Email state on and tells every open event stream, which is what the push
+// watcher listens for. Email/changes answers from this log.
+let emailState = 1;
+const deliveries = []; // { state, id }
+const streams = new Set();
+// The refresh token the fake currently honours: rt-0 is what an OAuth smoke session is seeded with.
+let refreshGeneration = 0;
+
+const ownMailboxes = mailboxes;
+const ownEmails = emails;
+
+function handle([name, args, callId]) {
+	const ok = (data) => [name, { accountId: args.accountId ?? ACC, ...data }, callId];
+	const fail = (type, description) => ['error', { type, description }, callId];
+	// Mail calls act in whichever account they name: yours, or the team's.
+	const team = args.accountId === TEAM;
+	const mailboxes = team ? teamMailboxes : ownMailboxes;
+	const emails = team ? teamEmails : ownEmails;
+	// As Stalwart: only an account's owner sends from it or sees its identities.
+	if (team && /^(EmailSubmission|Identity)\//.test(name)) return fail('forbidden', `You are not an owner of account ${TEAM}`);
+	switch (name) {
+		case 'Blob/copy': {
+			const copied = {};
+			for (const id of args.blobIds ?? []) {
+				if (!blobs[id] || !teamBlobs.has(id) || args.fromAccountId !== TEAM) continue;
+				blobs[`copy-${id}`] = blobs[id];
+				copied[id] = `copy-${id}`;
+			}
+			log('Blob/copy', JSON.stringify(copied));
+			return [name, { fromAccountId: args.fromAccountId, accountId: args.accountId, copied, notCopied: null }, callId];
+		}
+		case 'Mailbox/set': {
+			const created = {};
+			for (const [key, data] of Object.entries(args.create ?? {})) {
+				const id = `mb-${randomUUID().slice(0, 6)}`;
+				mailboxes.push({ id, name: data.name, role: null, parentId: data.parentId ?? null, totalEmails: 0, unreadEmails: 0, sortOrder: 10 });
+				created[key] = { id };
+				log('Mailbox created', id, JSON.stringify(data));
+			}
+			const updated = {};
+			const notUpdated = {};
+			for (const [id, patch] of Object.entries(args.update ?? {})) {
+				const mb = mailboxes.find((m) => m.id === id);
+				if (!mb) { notUpdated[id] = { type: 'notFound' }; continue; }
+				for (const [key, value] of Object.entries(patch)) {
+					if (!key.startsWith('shareWith/')) continue;
+					const principal = key.slice('shareWith/'.length);
+					mb.shareWith = { ...mb.shareWith };
+					if (value) mb.shareWith[principal] = value; else delete mb.shareWith[principal];
+					delete patch[key];
+				}
+				Object.assign(mb, patch);
+				updated[id] = null;
+				log('Mailbox updated', id, JSON.stringify(patch));
+			}
+			const destroyed = [];
+			const notDestroyed = {};
+			for (const id of args.destroy ?? []) {
+				if (mailboxes.some((m) => m.parentId === id)) { notDestroyed[id] = { type: 'mailboxHasChild' }; continue; }
+				const at = mailboxes.findIndex((m) => m.id === id);
+				if (at === -1) continue;
+				mailboxes.splice(at, 1);
+				destroyed.push(id);
+				log('Mailbox destroyed', id, `onDestroyRemoveEmails=${args.onDestroyRemoveEmails}`);
+			}
+			return ok({ oldState: 'm1', newState: 'm2', created, updated, notUpdated, destroyed, notDestroyed });
+		}
+		case 'FileNode/query': {
+			const nodes = nodesOf(args.accountId);
+			const f = args.filter ?? {};
+			const ids = nodes
+				.filter((n) => (f.isTopLevel ? n.parentId === null : true))
+				.filter((n) => ('parentId' in f ? n.parentId === f.parentId : true))
+				.filter((n) => (f.nodeType ? n.nodeType === f.nodeType : true))
+				.filter((n) => (f.text ? n.name.toLowerCase().includes(f.text.toLowerCase()) : true))
+				.map((n) => n.id);
+			return ok({ queryState: 'f1', ids, position: 0 });
+		}
+		case 'FileNode/get': {
+			const nodes = nodesOf(args.accountId);
+			const want = new Set(args.ids ?? nodes.map((n) => n.id));
+			if (args.fetchParents) {
+				for (const id of [...want]) {
+					for (let n = nodes.find((x) => x.id === id); n?.parentId; n = nodes.find((x) => x.id === n.parentId)) want.add(n.parentId);
+				}
+			}
+			const list = nodes.filter((n) => want.has(n.id));
+			return ok({ state: 'f1', list, notFound: [...want].filter((id) => !list.some((n) => n.id === id)) });
+		}
+		case 'FileNode/set': {
+			const nodes = nodesOf(args.accountId);
+			const clash = (parentId, name, self) => nodes.some((n) => n.parentId === parentId && n.name === name && n.id !== self);
+			const created = {};
+			const notCreated = {};
+			for (const [key, data] of Object.entries(args.create ?? {})) {
+				if (nodes.find((n) => n.id === data.parentId)?.myRights.mayAddChildren === false) { notCreated[key] = { type: 'forbidden', description: 'You can only read this folder' }; continue; }
+				if (clash(data.parentId ?? null, data.name)) { notCreated[key] = { type: 'alreadyExists', description: `“${data.name}” is already here` }; continue; }
+				const node = { ...fileNode(`fn-${randomUUID().slice(0, 6)}`, data.parentId ?? null, data.name), nodeType: data.nodeType, blobId: data.blobId ?? null, type: data.type ?? null, size: data.blobId ? blobs[data.blobId]?.[1].length ?? 0 : null, modified: new Date().toISOString() };
+				nodes.push(node);
+				created[key] = { id: node.id };
+				log('FileNode created', node.id, JSON.stringify(data));
+			}
+			const updated = {};
+			const notUpdated = {};
+			for (const [id, patch] of Object.entries(args.update ?? {})) {
+				const node = nodes.find((n) => n.id === id);
+				if (!node) { notUpdated[id] = { type: 'notFound' }; continue; }
+				if (clash(patch.parentId === undefined ? node.parentId : patch.parentId, patch.name ?? node.name, id)) { notUpdated[id] = { type: 'alreadyExists', description: 'Something by that name is already there' }; continue; }
+				Object.assign(node, patch, { modified: new Date().toISOString() });
+				updated[id] = null;
+				log('FileNode updated', id, JSON.stringify(patch));
+			}
+			const destroyed = [];
+			const notDestroyed = {};
+			const drop = (id) => {
+				for (const child of nodes.filter((n) => n.parentId === id)) drop(child.id);
+				nodes.splice(nodes.findIndex((n) => n.id === id), 1);
+			};
+			for (const id of args.destroy ?? []) {
+				if (!args.onDestroyRemoveChildren && nodes.some((n) => n.parentId === id)) { notDestroyed[id] = { type: 'nodeHasChildren' }; continue; }
+				drop(id);
+				destroyed.push(id);
+				log('FileNode destroyed', id, `onDestroyRemoveChildren=${args.onDestroyRemoveChildren}`);
+			}
+			return ok({ oldState: 'f1', newState: 'f2', created, notCreated, updated, notUpdated, destroyed, notDestroyed });
+		}
+		case 'VacationResponse/get':
+			return ok({ state: 'v1', list: [vacationResponse], notFound: [] });
+		case 'VacationResponse/set':
+			vacationResponse = { ...vacationResponse, ...(args.update?.singleton ?? {}) };
+			log('VacationResponse set', JSON.stringify(vacationResponse));
+			return ok({ oldState: 'v1', newState: 'v2', updated: { singleton: null } });
+		case 'Identity/set': {
+			const updated = {};
+			for (const [id, patch] of Object.entries(args.update ?? {})) {
+				const identity = identities.find((i) => i.id === id);
+				if (!identity) continue;
+				Object.assign(identity, patch);
+				updated[id] = null;
+				log('Identity updated', id, JSON.stringify(patch));
+			}
+			return ok({ oldState: 'i1', newState: 'i2', updated });
+		}
+		case 'EmailSubmission/set': {
+			const created = {};
+			for (const [key, sub] of Object.entries(args.create ?? {})) {
+				const email = emails.get(sub.emailId);
+				log('EmailSubmission created', JSON.stringify({ identityId: sub.identityId, from: email?.from, subject: email?.subject, body: email && Object.values(email.bodyValues ?? {})[0]?.value }));
+				created[key] = { id: `sub-${sub.emailId}` };
+				if (sub.envelope?.mailFrom?.parameters?.holdfor) pendingSends.add(`sub-${sub.emailId}`);
+				const patch = args.onSuccessUpdateEmail?.[`#${key}`];
+				if (email && patch?.mailboxIds) email.mailboxIds = { ...patch.mailboxIds };
+			}
+			const updated = {};
+			for (const [id, patch] of Object.entries(args.update ?? {})) {
+				if (patch.undoStatus === 'canceled') pendingSends.delete(id);
+				log('EmailSubmission updated', id, JSON.stringify(patch));
+				updated[id] = null;
+			}
+			return ok({ oldState: 'sub1', newState: 'sub2', created, updated });
+		}
+		case 'Mailbox/get':
+			return ok({ state: 'm1', list: args.ids ? mailboxes.filter((mb) => args.ids.includes(mb.id)) : mailboxes, notFound: [] });
+		case 'Email/query': {
+			const ascending = args.sort?.[0]?.isAscending === true;
+			// RFC 8620 §5.5: a filter is a condition or a FilterOperator; a bare
+			// `and` key is neither, and a real server rejects it — so does this one.
+			const matches = (email, filter) => {
+				if (!filter || typeof filter !== 'object') return true;
+				if ('and' in filter || 'or' in filter) throw Object.assign(new Error('invalidArguments'), { jmap: 'Unknown filter property' });
+				if (filter.operator) {
+					const results = (filter.conditions ?? []).map((c) => matches(email, c));
+					if (filter.operator === 'AND') return results.every(Boolean);
+					if (filter.operator === 'OR') return results.some(Boolean);
+					if (filter.operator === 'NOT') return !results.some(Boolean);
+				}
+				const has = (needle, hay) => String(hay ?? '').toLowerCase().includes(String(needle).toLowerCase());
+				const addr = (list) => (list ?? []).map((a) => `${a.name} ${a.email}`).join(' ');
+				if (filter.inMailbox && !email.mailboxIds[filter.inMailbox]) return false;
+				if (filter.inThread && email.threadId !== filter.inThread) return false;
+				if (filter.notKeyword && email.keywords[filter.notKeyword]) return false;
+				if (filter.hasKeyword && !email.keywords[filter.hasKeyword]) return false;
+				if (filter.hasAttachment !== undefined && !!email.hasAttachment !== filter.hasAttachment) return false;
+				if (filter.from && !has(filter.from, addr(email.from))) return false;
+				if (filter.to && !has(filter.to, addr(email.to))) return false;
+				if (filter.subject && !has(filter.subject, email.subject)) return false;
+				// Only the one header mail2 asks for: the message a reopened reply answers.
+				if (filter.header && !(filter.header[0] === 'Message-ID' && has(filter.header[1], (email.messageId ?? []).join(' ')))) return false;
+				if (filter.after && Date.parse(email.receivedAt) < Date.parse(filter.after)) return false;
+				if (filter.before && Date.parse(email.receivedAt) > Date.parse(filter.before)) return false;
+				if (filter.text && !has(filter.text, `${email.subject} ${email.preview} ${addr(email.from)} ${addr(email.to)}`)) return false;
+				return true;
+			};
+			let list;
+			try {
+				list = [...emails.values()].filter((e) => matches(e, args.filter));
+			} catch (error) {
+				log('Email/query rejected filter', JSON.stringify(args.filter));
+				return fail('invalidArguments', error.jmap ?? 'Invalid filter');
+			}
+			list.sort((a, b) => (ascending ? 1 : -1) * (Date.parse(a.receivedAt) - Date.parse(b.receivedAt)));
+			const position = args.position ?? 0;
+			const ids = list.slice(position, position + (args.limit ?? list.length)).map((e) => e.id);
+			return ok({ queryState: 'q1', canCalculateChanges: false, position, ids, total: list.length });
+		}
+		case 'Email/get': {
+			const ids = args.ids ?? [...emails.keys()];
+			return ok({ state: `e${emailState}`, list: ids.filter((id) => emails.has(id)).map((id) => emails.get(id)), notFound: ids.filter((id) => !emails.has(id)) });
+		}
+		case 'Email/changes': {
+			const since = Number(String(args.sinceState).slice(1)) || 0;
+			const created = deliveries.filter((d) => d.state > since).map((d) => d.id);
+			return ok({ oldState: args.sinceState, newState: `e${emailState}`, hasMoreChanges: false, created, updated: [], destroyed: [] });
+		}
+		case 'Email/set': {
+			const createdEmails = {};
+			for (const [key, data] of Object.entries(args.create ?? {})) {
+				const id = `out-${randomUUID().slice(0, 6)}`;
+				// The part tree Stalwart would build, so a reopened draft finds its attachments and cid images.
+				const bodyStructure = { type: 'multipart/mixed', subParts: [...(data.textBody ?? []), ...(data.htmlBody ?? []), ...(data.attachments ?? [])] };
+				emails.set(id, { threadId: id, keywords: {}, receivedAt: new Date().toISOString(), preview: '', to: [], cc: [], bodyStructure, messageId: [`${id}@smoke.example`], ...data, id });
+				createdEmails[key] = { id, blobId: id, threadId: id, size: 1 };
+				log('Email created', id, JSON.stringify({ from: data.from, to: data.to, cc: data.cc, bcc: data.bcc, subject: data.subject, inReplyTo: data.inReplyTo, references: data.references }));
+			}
+			const updated = {};
+			for (const [id, patch] of Object.entries(args.update ?? {})) {
+				const email = emails.get(id);
+				if (!email) continue;
+				for (const [k, v] of Object.entries(patch)) {
+					if (k.startsWith('keywords/')) {
+						const key = k.slice('keywords/'.length);
+						if (v) email.keywords[key] = true; else delete email.keywords[key];
+					} else if (k.startsWith('mailboxIds/')) {
+						const key = k.slice('mailboxIds/'.length);
+						if (v) email.mailboxIds[key] = true; else delete email.mailboxIds[key];
+					} else if (k === 'keywords' || k === 'mailboxIds') {
+						email[k] = { ...v };
+					}
+				}
+				updated[id] = null;
+				log('Email updated', id, JSON.stringify(patch));
+			}
+			const destroyed = [];
+			for (const id of args.destroy ?? []) if (emails.delete(id)) destroyed.push(id);
+			for (const mb of mailboxes) {
+				const inBox = [...emails.values()].filter((e) => e.mailboxIds[mb.id]);
+				mb.totalEmails = inBox.length;
+				mb.unreadEmails = inBox.filter((e) => !e.keywords.$seen).length;
+			}
+			return ok({ oldState: 'e1', newState: 'e2', created: createdEmails, updated, destroyed });
+		}
+		case 'EmailSubmission/query': {
+			const wanted = args.filter?.emailIds ?? [];
+			const ids = wanted.filter((id) => emails.get(id)?.mailboxIds.scheduled).map((id) => `sub-${id}`);
+			return ok({ queryState: 'sq1', ids: args.filter?.undoStatus === 'pending' ? ids.filter((id) => pendingSends.has(id)) : ids });
+		}
+		case 'EmailSubmission/get':
+			return ok({ state: 'sub1', list: (args.ids ?? []).map((id) => ({ id, emailId: id.slice(4), undoStatus: pendingSends.has(id) ? 'pending' : 'final' })), notFound: [] });
+		case 'Identity/get':
+			return ok({ state: 'i1', list: identities, notFound: [] });
+		case 'Quota/get':
+			return ok({ state: 'q', list: [{ id: 'q1', resourceType: 'octets', used: 123456789, hardLimit: 5000000000, scope: 'account', name: 'mail', types: ['Email'] }], notFound: [] });
+		case 'SieveScript/get':
+			return ok({ state: 's', list: sieveScripts, notFound: [] });
+		// A script containing "fail-validate" is refused, to exercise the error path.
+		case 'SieveScript/validate':
+			return ok({ error: String(blobs[args.blobId]?.[1] ?? '').includes('fail-validate') ? { type: 'invalidSieve', description: 'The script is not valid Sieve' } : null });
+		case 'SieveScript/set': {
+			const created = {};
+			for (const [key, data] of Object.entries(args.create ?? {})) {
+				const script = { id: `sieve-${randomUUID().slice(0, 6)}`, name: data.name, blobId: data.blobId, isActive: false };
+				sieveScripts.push(script);
+				created[key] = { id: script.id };
+			}
+			for (const [id, patch] of Object.entries(args.update ?? {})) Object.assign(sieveScripts.find((script) => script.id === id) ?? {}, patch);
+			const active = args.onSuccessActivateScript?.startsWith('#') ? created[args.onSuccessActivateScript.slice(1)]?.id : args.onSuccessActivateScript;
+			if (active) for (const script of sieveScripts) script.isActive = script.id === active;
+			return ok({ created, updated: Object.fromEntries(Object.keys(args.update ?? {}).map((id) => [id, null])) });
+		}
+		case 'AddressBook/get':
+			return ok({ state: 'ab', list: addressBooks, notFound: [] });
+		case 'ContactCard/query': {
+			const ids = [...cards.keys()];
+			const position = args.position ?? 0;
+			const limit = args.limit ?? ids.length;
+			return ok({ queryState: 'cq', canCalculateChanges: false, position, ids: ids.slice(position, position + limit), total: ids.length });
+		}
+		case 'ContactCard/get': {
+			const ids = args.ids ?? [...cards.keys()];
+			return ok({ state: 'cs', list: ids.filter((id) => cards.has(id)).map((id) => cards.get(id)), notFound: ids.filter((id) => !cards.has(id)) });
+		}
+		case 'ContactCard/set': {
+			const created = {};
+			for (const [key, card] of Object.entries(args.create ?? {})) {
+				const id = `c${randomUUID().slice(0, 6)}`;
+				cards.set(id, { ...card, id, updated: new Date().toISOString() });
+				created[key] = { id, updated: cards.get(id).updated };
+				log('ContactCard created', id, JSON.stringify(card).slice(0, 200));
+			}
+			const updated = {};
+			for (const [id, patch] of Object.entries(args.update ?? {})) {
+				const card = cards.get(id);
+				if (!card) continue;
+				for (const [k, v] of Object.entries(patch)) {
+					if (v === null) delete card[k];
+					else card[k] = v;
+				}
+				card.updated = new Date().toISOString();
+				updated[id] = null;
+				log('ContactCard updated', id, JSON.stringify(patch).slice(0, 200));
+			}
+			const destroyed = [];
+			for (const id of args.destroy ?? []) if (cards.delete(id)) destroyed.push(id);
+			return ok({ oldState: 'cs', newState: 'cs2', created, updated, destroyed });
+		}
+		case 'Calendar/get':
+			return ok({ state: 'cal', list: calendars, notFound: [] });
+		case 'Calendar/set': {
+			const updated = {};
+			for (const [id, patch] of Object.entries(args.update ?? {})) {
+				const cal = calendars.find((c) => c.id === id);
+				if (!cal) continue;
+				for (const [key, value] of Object.entries(patch)) {
+					// `shareWith/<principal>` is a pointer into the map; null takes that person off.
+					if (key.startsWith('shareWith/')) {
+						const who = key.slice('shareWith/'.length).replaceAll('~1', '/').replaceAll('~0', '~');
+						const next = { ...(cal.shareWith ?? {}) };
+						if (value) next[who] = value; else delete next[who];
+						cal.shareWith = Object.keys(next).length ? next : null;
+					} else cal[key] = value;
+				}
+				updated[id] = null;
+				log('Calendar updated', id, JSON.stringify(patch).slice(0, 200));
+			}
+			const destroyed = [];
+			const notDestroyed = {};
+			for (const id of args.destroy ?? []) {
+				const index = calendars.findIndex((c) => c.id === id);
+				if (index < 0) { notDestroyed[id] = { type: 'notFound' }; continue; }
+				const filed = [...events.values()].filter((e) => e.calendarIds[id]);
+				if (filed.length && !args.onDestroyRemoveEvents) {
+					notDestroyed[id] = { type: 'calendarHasEvent', description: 'The calendar still has events.' };
+					continue;
+				}
+				for (const e of filed) events.delete(e.id);
+				calendars.splice(index, 1);
+				destroyed.push(id);
+			}
+			if (args.onSuccessSetIsDefault) for (const c of calendars) c.isDefault = c.id === args.onSuccessSetIsDefault;
+			const created = {};
+			for (const [key, cal] of Object.entries(args.create ?? {})) {
+				const id = `cal${randomUUID().slice(0, 4)}`;
+				calendars.push({ id, isVisible: true, isSubscribed: true, myRights: calendars[0].myRights, color: '#7c3aed', ...cal });
+				created[key] = { id };
+			}
+			return ok({ oldState: 'cal', newState: 'cal2', created, updated, destroyed, notDestroyed });
+		}
+		case 'Principal/query': {
+			const needle = (args.filter?.email ?? args.filter?.text ?? '').toLowerCase();
+			const ids = principals
+				.filter((p) => (args.filter?.email ? p.email === needle : `${p.name} ${p.email}`.toLowerCase().includes(needle)))
+				.map((p) => p.id);
+			return ok({ queryState: 'pq', canCalculateChanges: false, position: 0, ids, total: ids.length });
+		}
+		case 'Principal/get': {
+			const ids = args.ids ?? principals.map((p) => p.id);
+			return ok({ state: 'p1', list: principals.filter((p) => ids.includes(p.id)), notFound: ids.filter((id) => !principals.some((p) => p.id === id)) });
+		}
+		case 'CalendarEvent/query': {
+			// No real expansion: hand back every event; the client filters by day anyway.
+			const list = [...events.values()];
+			const ids = list.map((e) => e.id);
+			if (args.expandRecurrences) {
+				// Fake one extra occurrence a week later for the weekly event.
+				for (const e of list) if (e.recurrenceRule) ids.push(`${e.id};${e.start.slice(0, 10)}+7`);
+			}
+			return ok({ queryState: 'eq', canCalculateChanges: false, position: 0, ids, total: ids.length });
+		}
+		case 'CalendarEvent/get': {
+			const ids = args.ids ?? [...events.keys()];
+			const list = [];
+			for (const id of ids) {
+				if (events.has(id)) { list.push(events.get(id)); continue; }
+				const [base] = id.split(';');
+				const master = events.get(base);
+				if (master) {
+					const d = new Date(master.start);
+					d.setDate(d.getDate() + 7);
+					const start = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}T${master.start.slice(11)}`;
+					list.push({ ...master, id, baseEventId: base, recurrenceId: start, start });
+				}
+			}
+			return ok({ state: 'es', list, notFound: [] });
+		}
+		case 'CalendarEvent/set': {
+			const created = {};
+			for (const [key, ev] of Object.entries(args.create ?? {})) {
+				const id = `e${randomUUID().slice(0, 6)}`;
+				events.set(id, { ...ev, id });
+				created[key] = { id };
+				log('CalendarEvent created', id, JSON.stringify(ev).slice(0, 220));
+			}
+			const updated = {};
+			const notUpdated = {};
+			for (const [id, patch] of Object.entries(args.update ?? {})) {
+				if (!events.has(id)) { notUpdated[id] = { type: 'notFound', description: 'synthetic ids cannot be updated by this fake' }; continue; }
+				const ev = events.get(id);
+				for (const [k, v] of Object.entries(patch)) {
+					if (k === 'calendarIds') { ev.calendarIds = Object.fromEntries(Object.entries(v).filter(([, on]) => on)); continue; }
+					if (k.includes('/')) {
+						// A patch path ("participants/p2/participationStatus"), as an RSVP sends.
+						const path = k.split('/');
+						const last = path.pop();
+						const parent = path.reduce((at, part) => (at[part] ??= {}), ev);
+						if (v === null) delete parent[last]; else parent[last] = v;
+						continue;
+					}
+					if (v === null) delete ev[k]; else ev[k] = v;
+				}
+				updated[id] = null;
+				log('CalendarEvent updated', id, JSON.stringify(patch).slice(0, 220));
+			}
+			const destroyed = [];
+			for (const id of args.destroy ?? []) if (events.delete(id)) destroyed.push(id);
+			return ok({ oldState: 'es', newState: 'es2', created, updated, notUpdated, destroyed });
+		}
+		case 'x:AccountPassword/get':
+			return ok({ state: 'p', list: [{ id: 'singleton', secret: '********', otpAuth: { otpUrl: totpUrl ? '********' : null, otpCode: null } }], notFound: [] });
+		case 'x:AccountPassword/set': {
+			const patch = args.update?.singleton ?? {};
+			log('AccountPassword/set', JSON.stringify({ ...patch, currentSecret: patch.currentSecret ? '<redacted>' : undefined, secret: patch.secret ? '<redacted>' : undefined }));
+			if (patch.currentSecret !== 'not-a-real-password') {
+				return ok({ notUpdated: { singleton: { type: 'forbidden', description: 'Current password is incorrect' } } });
+			}
+			if ('otpAuth/otpUrl' in patch) totpUrl = patch['otpAuth/otpUrl'];
+			return ok({ updated: { singleton: null } });
+		}
+		case 'x:AppPassword/query':
+			return ok({ ids: [...appPasswords.keys()] });
+		case 'x:AppPassword/get':
+			return ok({ list: (args.ids ?? [...appPasswords.keys()]).map((id) => appPasswords.get(id)).filter(Boolean), notFound: [] });
+		case 'x:AppPassword/set':
+		case 'x:ApiKey/set': {
+			const store = name.startsWith('x:AppPassword') ? appPasswords : apiKeys;
+			const prefix = name.startsWith('x:AppPassword') ? 'app_' : 'API_';
+			const created = {};
+			for (const [key, rec] of Object.entries(args.create ?? {})) {
+				const id = `${prefix}${randomUUID().slice(0, 6)}`;
+				store.set(id, { id, description: rec.description, createdAt: new Date().toISOString(), expiresAt: rec.expiresAt ?? null, allowedIps: rec.allowedIps ?? {} });
+				created[key] = { id, secret: `${prefix}${randomUUID().replaceAll('-', '')}` };
+				log(name, 'created', JSON.stringify(rec));
+			}
+			const destroyed = [];
+			for (const id of args.destroy ?? []) if (store.delete(id)) destroyed.push(id);
+			return ok({ created, updated: {}, destroyed });
+		}
+		case 'x:ApiKey/query':
+			return ok({ ids: [...apiKeys.keys()] });
+		case 'x:ApiKey/get':
+			return ok({ list: (args.ids ?? [...apiKeys.keys()]).map((id) => apiKeys.get(id)).filter(Boolean), notFound: [] });
+		default:
+			log('unknown method', name);
+			return fail('unknownMethod', `${name} is not implemented by the fake`);
+	}
+}
+
+/** Resolve `#ids` back-references against earlier responses in the same request. */
+function resolveRefs(args, responses) {
+	const out = { ...args };
+	for (const [key, value] of Object.entries(args)) {
+		if (!key.startsWith('#')) continue;
+		const ref = value;
+		const source = responses.find((r) => r[2] === ref.resultOf && r[0] === ref.name);
+		delete out[key];
+		out[key.slice(1)] = source ? source[1][ref.path.replace('/', '')] ?? [] : [];
+	}
+	return out;
+}
+
+http
+	.createServer((req, res) => {
+		// OAuth, just enough for server-auth's token refresh: discovery plus a token
+		// endpoint that ROTATES refresh tokens and refuses a used one, like a strict
+		// server would. A refreshed token that never gets saved shows up as invalid_grant.
+		if (req.method === 'GET' && req.url === '/.well-known/oauth-authorization-server') {
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			return res.end(JSON.stringify({
+				issuer: BASE, authorization_endpoint: `${BASE}/authorize`, token_endpoint: `${BASE}/token`,
+				code_challenge_methods_supported: ['S256'], scopes_supported: ['offline_access', 'urn:ietf:params:oauth:scope:mail']
+			}));
+		}
+		if (req.method === 'POST' && req.url === '/token') {
+			let body = '';
+			req.on('data', (chunk) => (body += chunk));
+			req.on('end', () => {
+				const form = new URLSearchParams(body);
+				const presented = form.get('refresh_token');
+				if (form.get('grant_type') !== 'refresh_token' || presented !== `rt-${refreshGeneration}`) {
+					log('token refresh REFUSED', presented, `(current rt-${refreshGeneration})`);
+					res.writeHead(400, { 'Content-Type': 'application/json' });
+					return res.end(JSON.stringify({ error: 'invalid_grant' }));
+				}
+				refreshGeneration += 1;
+				log('token refresh', presented, '→', `rt-${refreshGeneration}`);
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ access_token: `at-${refreshGeneration}`, refresh_token: `rt-${refreshGeneration}`, token_type: 'Bearer', expires_in: 60, scope: 'offline_access urn:ietf:params:oauth:scope:mail' }));
+			});
+			return;
+		}
+		// Register's password-reset API (REGISTER_API_URL=http://127.0.0.1:9911):
+		// the one good token is `smoke-token`, and the reset logs the request.
+		if (req.url.startsWith('/api/forgot-password/')) {
+			const route = new URL(req.url, BASE);
+			let body = '';
+			req.on('data', (chunk) => (body += chunk));
+			req.on('end', () => {
+				const input = req.method === 'GET' ? Object.fromEntries(route.searchParams) : JSON.parse(body || '{}');
+				const valid = input.token === 'smoke-token';
+				const answer = route.pathname.endsWith('/request')
+					? [200, { ok: true, message: 'If an account exists for that address, we sent reset instructions to its recovery email.' }]
+					: !valid
+						? [400, { valid: false, error: 'This reset link is invalid or has expired.' }]
+						: route.pathname.endsWith('/verify')
+							? [200, { valid: true, mailboxEmail: input.email }]
+							: [200, { success: true, mailboxEmail: input.email }];
+				log('register', route.pathname, input.email, req.headers['x-zaur-client-ip'] ?? '(no client ip)');
+				res.writeHead(answer[0], { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify(answer[1]));
+			});
+			return;
+		}
+		if (req.method === 'POST' && req.url === '/smoke/deliver') {
+			let body = '';
+			req.on('data', (chunk) => (body += chunk));
+			req.on('end', () => {
+				const input = body ? JSON.parse(body) : {};
+				const id = `m-${randomUUID().slice(0, 8)}`;
+				emails.set(id, {
+					id, threadId: `t-${id}`, mailboxIds: { inbox: true }, keywords: {}, messageId: [`${id}@smoke.example`],
+					from: [{ name: input.fromName ?? 'Ada Lovelace', email: input.from ?? 'ada@example.com' }],
+					to: [{ name: 'Smoke Tester', email: 'smoke@zaur.app' }],
+					subject: input.subject ?? 'Notes on the engine', receivedAt: new Date().toISOString(), hasAttachment: false,
+					preview: 'Fresh off the fake wire.', ...text('1', 'Fresh off the fake wire.')
+				});
+				emailState += 1;
+				deliveries.push({ state: emailState, id });
+				const inbox = mailboxes.find((mb) => mb.id === 'inbox');
+				inbox.totalEmails += 1;
+				inbox.unreadEmails += 1;
+				const change = JSON.stringify({ '@type': 'StateChange', changed: { [ACC]: { Email: `e${emailState}`, Mailbox: `m${emailState}` } } });
+				for (const stream of streams) stream.write(`event: state\ndata: ${change}\n\n`);
+				log('delivered', id, `→ ${streams.size} event stream(s)`);
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ id, threadId: `t-${id}`, state: `e${emailState}` }));
+			});
+			return;
+		}
+		if (!req.headers.authorization) {
+			res.writeHead(401, { 'WWW-Authenticate': 'Basic' });
+			return res.end('auth required');
+		}
+		if (req.method === 'GET' && (req.url === '/.well-known/jmap' || req.url === '/jmap/session')) {
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			return res.end(JSON.stringify(session));
+		}
+		if (req.method === 'GET' && req.url.startsWith('/jmap/eventsource')) {
+			res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+			res.write('event: ping\ndata: {"interval":30}\n\n');
+			const timer = setInterval(() => res.write('event: ping\ndata: {"interval":30}\n\n'), 25000);
+			streams.add(res);
+			req.on('close', () => {
+				clearInterval(timer);
+				streams.delete(res);
+			});
+			return;
+		}
+		if (req.method === 'GET' && req.url.startsWith('/jmap/download/')) {
+			const [, , , accountId, rawBlobId] = req.url.split('/');
+			const blobId = decodeURIComponent(rawBlobId ?? '');
+			const blob = teamBlobs.has(blobId) === (accountId === TEAM) ? blobs[blobId] : undefined;
+			if (!blob) {
+				res.writeHead(404);
+				return res.end('no such blob');
+			}
+			res.writeHead(200, { 'Content-Type': blob[0] });
+			return res.end(blob[1]);
+		}
+		if (req.method === 'POST' && req.url.startsWith('/jmap/upload/')) {
+			const chunks = [];
+			req.on('data', (chunk) => chunks.push(chunk));
+			req.on('end', () => {
+				const blobId = `blob-up-${randomUUID().slice(0, 6)}`;
+				const type = req.headers['content-type'] ?? 'application/octet-stream';
+				blobs[blobId] = [type, Buffer.concat(chunks)];
+				log('uploaded', blobId, type, blobs[blobId][1].length, 'bytes');
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ accountId: ACC, blobId, type, size: blobs[blobId][1].length }));
+			});
+			return;
+		}
+		if (req.method === 'POST' && req.url === '/jmap') {
+			let body = '';
+			req.on('data', (chunk) => (body += chunk));
+			req.on('end', () => {
+				const request = JSON.parse(body);
+				const responses = [];
+				for (const call of request.methodCalls) {
+					const [name, args, callId] = call;
+					responses.push(handle([name, resolveRefs(args, responses), callId]));
+				}
+				log(request.methodCalls.map((c) => c[0]).join(', '), '→', responses.map((r) => r[0]).join(', '));
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ methodResponses: responses, sessionState: 's1' }));
+			});
+			return;
+		}
+		res.writeHead(404);
+		res.end('not found');
+	})
+	.listen(PORT, '127.0.0.1', () => log(`fake JMAP listening on ${BASE}`));

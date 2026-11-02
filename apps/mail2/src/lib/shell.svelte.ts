@@ -1,0 +1,89 @@
+import { getContext, setContext, type Snippet } from 'svelte';
+import type { ChangedTypes } from '#lib/mail/live';
+import { appName } from '#lib/brand';
+
+/**
+ * The shell's header belongs to the `(app)` layout, so the mark, the section
+ * tabs and the account tile mount once and stay put while the sections change
+ * under them. What a section adds to the bar is its own, so it hands the
+ * layout a snippet: snippets close over the page's state, which is how Mail's
+ * search field lives in the layout's header and still belongs to Mail.
+ */
+export class Shell {
+	/** The current section's part of the header. */
+	bar = $state.raw<Snippet>();
+	/** Classes for the whole header: Mail steps it out on a phone reading a thread. */
+	barClass = $state('');
+	/** Whether a phone shows the section tabs: Mail leaves them out while it reads a thread. */
+	tabs = $state(true);
+	/** The app column, for whoever positions floating things against it. */
+	frame = $state<HTMLElement | null>(null);
+	/** Unread in the inbox, kept by the layout so every section's tab can say it. */
+	unread = $state(0);
+	/** A section's tab title: a pinned tab says how much is waiting in the inbox, whichever section it is on. */
+	title(name: string): string {
+		return `${this.unread > 0 ? `(${this.unread}) ` : ''}${name} · ${appName}`;
+	}
+	/**
+	 * Who holds the bar — deliberately not state. An effect's teardown reads
+	 * state as it was before the change that ran it, so a section leaving would
+	 * still see itself in `bar` and wipe the one its successor just set.
+	 */
+	owner: Snippet | undefined;
+	/**
+	 * Mail's lists, to be asked again after a send or a draft save. Compose's
+	 * transport is the layout's (the outbox sends from every section); the
+	 * lists are Mail's, and only while it is the section on show.
+	 */
+	mailChanged: ((anyList: boolean) => void) | undefined;
+	/**
+	 * Push. The stream is the layout's — one, whichever section is open, so the
+	 * inbox count keeps moving in all of them — and a section hears what changed
+	 * for as long as it is mounted: `$effect(() => shell.onLive(…))`.
+	 */
+	#live = new Set<(changed: ChangedTypes) => void>();
+	onLive(listener: (changed: ChangedTypes) => void): () => void {
+		this.#live.add(listener);
+		return () => void this.#live.delete(listener);
+	}
+	tellLive(changed: ChangedTypes): void {
+		for (const listener of this.#live) listener(changed);
+	}
+}
+
+// A string, not a Symbol: Vite's HMR can hold two instances of this module at
+// once, and each would mint its own Symbol, so the layout and the page would
+// miss each other's context until the dev server restarted.
+const KEY = 'zaur:shell';
+
+export function provideShell(): Shell {
+	return setContext(KEY, new Shell());
+}
+
+/** Undefined outside the `(app)` layout. */
+export function getShell(): Shell | undefined {
+	return getContext<Shell | undefined>(KEY);
+}
+
+/**
+ * Put `bar` in the shell's header for as long as the caller is mounted. The
+ * next section claims the bar before or after this one lets go, so letting go
+ * only clears what is still ours.
+ */
+export function useShellBar(shell: Shell, bar: Snippet, barClass: () => string = () => ''): void {
+	// Two effects: a changing class must not drop and re-claim the bar, which
+	// would rebuild Mail's search field under the person typing in it.
+	$effect.pre(() => {
+		shell.owner = bar;
+		shell.bar = bar;
+		return () => {
+			if (shell.owner !== bar) return;
+			shell.owner = undefined;
+			shell.bar = undefined;
+			shell.barClass = '';
+		};
+	});
+	$effect.pre(() => {
+		if (shell.owner === bar) shell.barClass = barClass();
+	});
+}

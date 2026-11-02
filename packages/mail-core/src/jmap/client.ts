@@ -1,0 +1,3091 @@
+import type {
+	JMAPChangesResult,
+	JMAPIdentity,
+	JMAPMailbox,
+	JMAPMailboxRights,
+	JMAPMethodCall,
+	JMAPResponse,
+	JMAPSession,
+	JMAPEmail,
+	JMAPQuota,
+	JMAPSieveScript,
+	JMAPVacationResponse
+} from './types';
+import { allOf, parseSearchQuery } from '../mail/search-query';
+import { emailQueryHasMore } from './email-query';
+import {
+	answerHeaders,
+	buildEmailCreateData,
+	recipientEmail,
+	type ComposeFormat,
+	type EmailAnswerInput,
+	type EmailAttachmentInput,
+	type EmailRecipientInput
+} from './email-build';
+import { resolveMailAccountId } from './account';
+import { buildDownloadUrl, buildUploadUrl } from './urls';
+import type {
+	CalendarEventQueryResult,
+	JMAPCalendar,
+	JMAPCalendarEvent,
+	JMAPCalendarRights,
+	JMAPPrincipal
+} from './calendar-types';
+import { CALENDAR_PROPERTIES } from './calendar-types';
+import type { JmapRecurrenceRule } from './recurrence';
+import { shareWithPointerPatch } from './calendar-rights';
+import type {
+	JMAPFileNode,
+	JMAPFileNodeCapability,
+	JMAPFileRights
+} from './file-types';
+import { FILE_NODE_PROPERTIES } from './file-types';
+import type { JMAPAddressBook, JMAPContactCard } from './contact-types';
+import { ADDRESS_BOOK_PROPERTIES, CONTACTS_URN, CONTACT_CARD_PROPERTIES } from './contact-types';
+import { JmapMethodError } from './errors';
+
+// Unauthorized handling is platform-injected: webmail leaves the default
+// (a `zaur:unauthorized` DOM event), native registers a listener.
+let unauthorizedListener: (() => void) | null = null;
+
+export function setJmapUnauthorizedListener(listener: (() => void) | null): void {
+	unauthorizedListener = listener;
+}
+
+function notifyUnauthorized(): void {
+	if (unauthorizedListener) {
+		unauthorizedListener();
+		return;
+	}
+	if (
+		typeof window !== 'undefined' &&
+		typeof window.dispatchEvent === 'function' &&
+		typeof CustomEvent !== 'undefined'
+	) {
+		window.dispatchEvent(new CustomEvent('zaur:unauthorized'));
+	}
+}
+
+interface CachedSessionData {
+	session: JMAPSession;
+	apiUrl: string;
+	accountId: string;
+	username: string;
+}
+
+interface CachedSessionEntry {
+	data: CachedSessionData;
+	timestamp: number;
+}
+
+const SESSION_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+function basicAuthHeader(username: string, password: string): string {
+	const credentials = `${username}:${password}`;
+	// Node fallback via globalThis so the package typechecks without node types.
+	const BufferCtor = (
+		globalThis as {
+			Buffer?: { from(data: string, encoding: string): { toString(encoding: string): string } };
+		}
+	).Buffer;
+	if (BufferCtor) {
+		return `Basic ${BufferCtor.from(credentials, 'utf8').toString('base64')}`;
+	}
+	return `Basic ${btoa(credentials)}`;
+}
+
+/**
+ * Stalwart caps concurrent requests per account, and every tab and device of
+ * that account counts. A refused request never ran, so trying again is safe.
+ */
+async function whenNotBusy(send: () => Promise<Response>): Promise<Response> {
+	for (let attempt = 0; ; attempt++) {
+		const response = await send();
+		if (response.status !== 400 || attempt >= 4) return response;
+		if (!(await response.clone().text()).includes('maxConcurrentRequests')) return response;
+		await new Promise((resolve) => setTimeout(resolve, 200 * 2 ** attempt * (0.5 + Math.random())));
+	}
+}
+
+const sessionCache = new Map<string, CachedSessionEntry>();
+
+function originOf(url: string): string | null {
+	try {
+		return new URL(url).origin;
+	} catch {
+		return null;
+	}
+}
+
+const CALENDARS_URN = 'urn:ietf:params:jmap:calendars';
+const CALENDAR_USING = ['urn:ietf:params:jmap:core', CALENDARS_URN] as const;
+const FILENODE_URN = 'urn:ietf:params:jmap:filenode';
+const FILENODE_USING = ['urn:ietf:params:jmap:core', FILENODE_URN] as const;
+const PRINCIPALS_URN = 'urn:ietf:params:jmap:principals';
+const PRINCIPALS_OWNER_URN = 'urn:ietf:params:jmap:principals:owner';
+const PRINCIPAL_USING = ['urn:ietf:params:jmap:core', PRINCIPALS_URN] as const;
+const MAIL_URN = 'urn:ietf:params:jmap:mail';
+const MAILBOX_SHARE_USING = ['urn:ietf:params:jmap:core', MAIL_URN, PRINCIPALS_URN];
+const QUOTA_URN = 'urn:ietf:params:jmap:quota';
+const QUOTA_USING = ['urn:ietf:params:jmap:core', QUOTA_URN] as const;
+const VACATION_URN = 'urn:ietf:params:jmap:vacationresponse';
+const VACATION_USING = ['urn:ietf:params:jmap:core', VACATION_URN] as const;
+const SIEVE_URN = 'urn:ietf:params:jmap:sieve';
+const SIEVE_USING = ['urn:ietf:params:jmap:core', SIEVE_URN] as const;
+const CONTACTS_USING = ['urn:ietf:params:jmap:core', CONTACTS_URN] as const;
+/** RFC 9661 §2.2 — the media type a script blob is uploaded as. */
+const SIEVE_MEDIA_TYPE = 'application/sieve';
+
+const CALENDAR_EVENT_PROPERTIES = [
+	'id',
+	'baseEventId',
+	'recurrenceId',
+	'calendarIds',
+	'title',
+	'description',
+	'start',
+	'duration',
+	'timeZone',
+	'showWithoutTime',
+	'utcStart',
+	'utcEnd',
+	'locations',
+	'recurrenceRule',
+	'recurrenceRules'
+] as const;
+
+const EMAIL_LIST_PROPERTIES = [
+	'id',
+	'threadId',
+	'mailboxIds',
+	'keywords',
+	'size',
+	'receivedAt',
+	'from',
+	'to',
+	'cc',
+	'bcc',
+	'subject',
+	'preview',
+	'hasAttachment'
+] as const;
+
+const EMAIL_DETAIL_PROPERTIES = [
+	'id',
+	'threadId',
+	'mailboxIds',
+	'keywords',
+	'receivedAt',
+	'from',
+	'to',
+	'cc',
+	'bcc',
+	'replyTo',
+	'messageId',
+	'inReplyTo',
+	'references',
+	'subject',
+	'preview',
+	'textBody',
+	'htmlBody',
+	'bodyValues',
+	'hasAttachment',
+	'bodyStructure'
+] as const;
+
+function jmapFailureMessage(value: unknown, fallback: string): string {
+	if (value && typeof value === 'object') {
+		const failure = value as { description?: unknown; type?: unknown };
+		if (typeof failure.description === 'string' && failure.description) return failure.description;
+		if (typeof failure.type === 'string' && failure.type) return failure.type;
+	}
+	return fallback;
+}
+
+function assertNoMethodErrors(response: JMAPResponse, fallback: string): void {
+	for (const [methodName, result] of response.methodResponses ?? []) {
+		if (methodName.endsWith('/error') || methodName === 'error') {
+			throw new Error(jmapFailureMessage(result, fallback));
+		}
+	}
+}
+
+function assertEmailSetSucceeded(response: JMAPResponse, fallback: string): Record<string, unknown> {
+	assertNoMethodErrors(response, fallback);
+	const first = response.methodResponses?.find(([methodName]) => methodName === 'Email/set');
+	if (!first) throw new Error('Unexpected Email/set response');
+
+	const result = first[1];
+	const failureBuckets = [result.notCreated, result.notUpdated, result.notDestroyed];
+	for (const bucket of failureBuckets) {
+		if (bucket && typeof bucket === 'object' && Object.keys(bucket).length) {
+			throw new Error(jmapFailureMessage(Object.values(bucket)[0], fallback));
+		}
+	}
+
+	return result;
+}
+
+function firstSetFailure(
+	bucket: unknown
+): { description?: string; type?: string } | undefined {
+	if (!bucket || typeof bucket !== 'object') return undefined;
+	const values = Object.values(bucket as Record<string, { description?: string; type?: string }>);
+	return values.length ? values[0] : undefined;
+}
+
+export interface EmailQueryResult {
+	emails: JMAPEmail[];
+	/** Matching rows when the server sent `total`; null if it was omitted. */
+	total: number | null;
+	hasMore: boolean;
+}
+
+export class JMAPClient {
+	private serverUrl: string;
+	private username: string;
+	private password?: string;
+	private authHeader: string;
+	private apiUrl = '';
+	private accountId = '';
+	private session: JMAPSession | null = null;
+	private readonly proxyMode: boolean;
+	private readonly isTokenAuth: boolean;
+	private readonly refreshAuth?: () => Promise<string | null>;
+
+	constructor(
+		serverUrl: string,
+		username: string,
+		passwordOrToken: string,
+		proxyMode = false,
+		isToken = false,
+		refreshAuth?: () => Promise<string | null>
+	) {
+		this.serverUrl = serverUrl.replace(/\/$/, '');
+		this.username = username;
+		this.password = isToken ? undefined : passwordOrToken;
+		this.proxyMode = proxyMode;
+		this.isTokenAuth = isToken;
+		this.refreshAuth = refreshAuth;
+		this.authHeader = proxyMode
+			? ''
+			: isToken
+				? `Bearer ${passwordOrToken}`
+				: basicAuthHeader(username, passwordOrToken);
+	}
+
+	/** Browser client that routes JMAP through the server-side proxy. */
+	static createProxy(): JMAPClient {
+		return new JMAPClient('', '', '', true);
+	}
+
+	getSession(): JMAPSession | null {
+		return this.session;
+	}
+
+	getAccountId(): string {
+		return this.accountId;
+	}
+
+	/**
+	 * The same connection acting in another mail account the session lists — a
+	 * mailbox someone shared with you. Every mail method then works on that
+	 * account; session and credentials stay this client's, a refreshed token
+	 * included. Null when the session has no such mail account.
+	 */
+	forAccount(accountId: string): JMAPClient | null {
+		if (accountId === this.accountId) return this;
+		if (!this.session?.accounts?.[accountId]?.accountCapabilities?.[MAIL_URN]) return null;
+		const view = Object.create(this) as JMAPClient;
+		view.accountId = accountId;
+		Object.defineProperty(view, 'authHeader', {
+			get: () => this.authHeader,
+			set: (value: string) => (this.authHeader = value)
+		});
+		return view;
+	}
+
+	/** Mail accounts shared with you: every one the session lists besides your own. */
+	getSharedMailAccounts(): { id: string; name: string }[] {
+		return Object.entries(this.session?.accounts ?? {})
+			.filter(([id, account]) => id !== this.accountId && account.accountCapabilities?.[MAIL_URN])
+			.map(([id, account]) => ({ id, name: account.name || id }));
+	}
+
+	hasCalendars(): boolean {
+		if (this.session?.capabilities?.[CALENDARS_URN]) return true;
+		const accountId = this.getCalendarAccountId();
+		return !!this.session?.accounts?.[accountId]?.accountCapabilities?.[CALENDARS_URN];
+	}
+
+	hasFileNode(): boolean {
+		if (this.session?.capabilities?.[FILENODE_URN]) return true;
+		const accountId = this.getFileNodeAccountId();
+		return !!this.session?.accounts?.[accountId]?.accountCapabilities?.[FILENODE_URN];
+	}
+
+	getFileNodeAccountId(): string {
+		return this.session?.primaryAccounts?.[FILENODE_URN] ?? this.accountId;
+	}
+
+	/** Own FileNode account plus any shared accounts advertised on the session. */
+	getFileNodeAccountIds(): string[] {
+		const primary = this.getFileNodeAccountId();
+		const ids = new Set<string>();
+		if (primary) ids.add(primary);
+		for (const [id, account] of Object.entries(this.session?.accounts ?? {})) {
+			if (account.accountCapabilities?.[FILENODE_URN]) ids.add(id);
+		}
+		return [...ids];
+	}
+
+	private fileNodeAccount(accountId?: string | null): string {
+		return accountId || this.getFileNodeAccountId();
+	}
+
+	getFileNodeCapability(): JMAPFileNodeCapability | null {
+		const accountId = this.getFileNodeAccountId();
+		const caps = this.session?.accounts?.[accountId]?.accountCapabilities?.[FILENODE_URN] as
+			| JMAPFileNodeCapability
+			| undefined;
+		return caps ?? null;
+	}
+
+	getCalendarAccountId(): string {
+		return this.session?.primaryAccounts?.[CALENDARS_URN] ?? this.accountId;
+	}
+
+	/** Own calendar account plus any shared accounts advertised on the session. */
+	getCalendarAccountIds(): string[] {
+		const primary = this.getCalendarAccountId();
+		const ids = new Set<string>();
+		if (primary) ids.add(primary);
+		for (const [id, account] of Object.entries(this.session?.accounts ?? {})) {
+			if (account.accountCapabilities?.[CALENDARS_URN]) ids.add(id);
+		}
+		return [...ids];
+	}
+
+	private calendarAccount(accountId?: string | null): string {
+		return accountId || this.getCalendarAccountId();
+	}
+
+	hasPrincipals(): boolean {
+		return !!this.session?.capabilities?.[PRINCIPALS_URN];
+	}
+
+	getPrincipalAccountId(): string {
+		const calendarAccountId = this.getCalendarAccountId();
+		const owner = this.session?.accounts?.[calendarAccountId]?.accountCapabilities?.[
+			PRINCIPALS_OWNER_URN
+		] as { accountIdForPrincipal?: string } | undefined;
+		if (owner?.accountIdForPrincipal) return owner.accountIdForPrincipal;
+
+		const primary = this.session?.primaryAccounts?.[PRINCIPALS_URN];
+		if (primary) return primary;
+
+		if (this.session?.accounts) {
+			for (const [id, account] of Object.entries(this.session.accounts)) {
+				if (account.accountCapabilities?.[PRINCIPALS_URN]) return id;
+			}
+		}
+
+		return this.accountId;
+	}
+
+	getCurrentUserPrincipalId(): string | null {
+		const accountId = this.getPrincipalAccountId();
+		const caps = this.session?.accounts?.[accountId]?.accountCapabilities?.[PRINCIPALS_URN] as
+			| { currentUserPrincipalId?: string | null }
+			| undefined;
+		return caps?.currentUserPrincipalId ?? null;
+	}
+
+	hasQuota(): boolean {
+		return !!this.session?.capabilities?.[QUOTA_URN];
+	}
+
+	hasSieve(): boolean {
+		// Same shape as vacation: Stalwart can gate the account-level entry on
+		// per-account permissions, so a session-level miss is not a no.
+		if (this.session?.capabilities?.[SIEVE_URN]) return true;
+		return !!this.session?.accounts?.[this.accountId]?.accountCapabilities?.[SIEVE_URN];
+	}
+
+	hasVacationResponse(): boolean {
+		// RFC 8621 §8 lists the urn in both places; Stalwart gates the account-level
+		// entry on per-account permissions, so check there too.
+		if (this.session?.capabilities?.[VACATION_URN]) return true;
+		return !!this.session?.accounts?.[this.accountId]?.accountCapabilities?.[VACATION_URN];
+	}
+
+	getUsername(): string {
+		return this.username;
+	}
+
+	private async authenticatedFetch(url: string, init?: RequestInit): Promise<Response> {
+		const execute = () => {
+			const headers = {
+				...(init?.headers as Record<string, string> | undefined),
+				Authorization: this.authHeader
+			};
+			return fetch(url, { ...init, headers });
+		};
+		let response = await execute();
+		if (response.status === 401 && this.refreshAuth) {
+			const token = await this.refreshAuth();
+			if (token) {
+				this.authHeader = `Bearer ${token}`;
+				response = await execute();
+			}
+		}
+		return response;
+	}
+
+	async connect(): Promise<void> {
+		if (this.proxyMode) {
+			const sessionResponse = await fetch('/api/jmap/session');
+
+			if (!sessionResponse.ok) {
+				if (sessionResponse.status === 401) {
+					notifyUnauthorized();
+					throw new Error('Unauthorized');
+				}
+				const payload = (await sessionResponse.json().catch(() => ({}))) as { error?: string };
+				throw new Error(payload.error ?? `Failed to get session: ${sessionResponse.status}`);
+			}
+
+			const payload = (await sessionResponse.json()) as {
+				session: JMAPSession;
+				accountId: string;
+				username: string;
+			};
+
+			this.session = payload.session;
+			this.apiUrl = '/api/jmap';
+			this.accountId = payload.accountId;
+			this.username = payload.username;
+			return;
+		}
+
+		// A base URL is discovered (RFC 8620 §2.2); one with a path is the session
+		// resource itself, e.g. Fastmail's https://api.fastmail.com/jmap/session.
+		const sessionUrl =
+			new URL(this.serverUrl).pathname.length > 1 ? this.serverUrl : `${this.serverUrl}/.well-known/jmap`;
+		// Bearer tokens rotate and must not become long-lived cache keys containing
+		// credentials. OAuth sessions reconnect against Stalwart instead.
+		const cacheKey = this.isTokenAuth ? '' : `${this.serverUrl}|${this.authHeader}`;
+		const cached = cacheKey ? sessionCache.get(cacheKey) : undefined;
+		const now = Date.now();
+
+		if (cached && (now - cached.timestamp < SESSION_CACHE_TTL_MS)) {
+			this.session = cached.data.session;
+			this.apiUrl = cached.data.apiUrl;
+			this.accountId = cached.data.accountId;
+			this.username = cached.data.username;
+			return;
+		}
+		if (cached) sessionCache.delete(cacheKey);
+
+		try {
+			const sessionResponse = await whenNotBusy(() =>
+				this.authenticatedFetch(sessionUrl, { method: 'GET' })
+			);
+
+			if (!sessionResponse.ok) {
+				if (sessionResponse.status === 401) {
+					sessionCache.delete(cacheKey);
+					throw new Error('Invalid username or password');
+				}
+				throw new Error(`Failed to get session: ${sessionResponse.status}`);
+			}
+
+			const session = (await sessionResponse.json()) as JMAPSession;
+			this.rewriteSessionUrls(session);
+
+			this.session = session;
+			this.apiUrl = session.apiUrl;
+
+			if (session.username) {
+				this.username = session.username;
+			}
+
+			const mailAccount = resolveMailAccountId(session, this.username);
+			this.accountId = mailAccount;
+
+			if (!this.accountId) {
+				throw new Error('No mail account found in session');
+			}
+
+			if (cacheKey) {
+				sessionCache.set(cacheKey, {
+					data: {
+						session,
+						apiUrl: this.apiUrl,
+						accountId: this.accountId,
+						username: this.username
+					},
+					timestamp: Date.now()
+				});
+			}
+		} catch (error) {
+			if (
+				error instanceof TypeError &&
+				(error.message === 'Failed to fetch' || error.message.includes('NetworkError'))
+			) {
+				try {
+					await fetch(sessionUrl, { mode: 'no-cors' });
+					throw new Error('CORS_ERROR');
+				} catch (inner) {
+					if (inner instanceof Error && inner.message === 'CORS_ERROR') throw inner;
+				}
+			}
+			throw error;
+		}
+	}
+
+	disconnect(): void {
+		this.apiUrl = '';
+		this.accountId = '';
+		this.session = null;
+	}
+
+	async downloadBlob(blobId: string, name: string, type: string): Promise<Response> {
+		if (this.proxyMode) {
+			const params = new URLSearchParams({ blobId, name, type });
+			return fetch(`/api/jmap/download?${params}`);
+		}
+
+		if (!this.session) {
+			throw new Error('Not connected. Call connect() first.');
+		}
+
+		const url = buildDownloadUrl(this.session.downloadUrl, this.accountId, blobId, name, type);
+		return this.authenticatedFetch(url);
+	}
+
+	async uploadBlob(
+		data: ArrayBuffer | Blob,
+		type: string
+	): Promise<{ blobId: string; size: number; type: string }> {
+		if (this.proxyMode) {
+			const response = await fetch('/api/jmap/upload', {
+				method: 'POST',
+				headers: { 'Content-Type': type || 'application/octet-stream' },
+				body: data
+			});
+
+			if (!response.ok) {
+				const payload = (await response.json().catch(() => ({}))) as {
+					error?: string;
+					message?: string;
+				};
+				throw new Error(
+					payload.error ?? payload.message ?? `Upload failed: ${response.status}`
+				);
+			}
+
+			return (await response.json()) as { blobId: string; size: number; type: string };
+		}
+
+		if (!this.session?.uploadUrl) {
+			throw new Error('Upload not supported by this server');
+		}
+
+		const url = buildUploadUrl(this.session.uploadUrl, this.accountId);
+
+		const response = await this.authenticatedFetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': type || 'application/octet-stream' },
+			body: data
+		});
+
+		if (!response.ok) {
+			const detail = (await response.text()).slice(0, 200);
+			throw new Error(
+				detail ? `Upload failed: ${response.status} - ${detail}` : `Upload failed: ${response.status}`
+			);
+		}
+
+		const payload = (await response.json()) as {
+			blobId?: string;
+			size?: number;
+			type?: string;
+		};
+
+		if (!payload.blobId) {
+			throw new Error('Upload response missing blobId');
+		}
+
+		return {
+			blobId: payload.blobId,
+			size: payload.size ?? 0,
+			type: payload.type ?? type
+		};
+	}
+
+	async fetchSyncStates(): Promise<Record<string, string>> {
+		const response = await this.request([
+			['Mailbox/get', { accountId: this.accountId, ids: [], properties: ['id'] }, 'mb'],
+			['Email/get', { accountId: this.accountId, ids: [], properties: ['id'] }, 'em']
+		]);
+
+		const states: Record<string, string> = {};
+		for (const [method, result] of response.methodResponses ?? []) {
+			if (method === 'Mailbox/get' && result.state) states.Mailbox = result.state as string;
+			if (method === 'Email/get' && result.state) states.Email = result.state as string;
+		}
+		return states;
+	}
+
+	async getEmailChanges(sinceState: string, maxChanges = 500): Promise<JMAPChangesResult> {
+		const response = await this.request([
+			[
+				'Email/changes',
+				{ accountId: this.accountId, sinceState, maxChanges },
+				'ec0'
+			]
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] === 'error') {
+			const error = first[1] as { type?: string; description?: string };
+			throw new Error(error.description ?? error.type ?? 'Email/changes failed');
+		}
+		if (first?.[0] !== 'Email/changes') {
+			throw new Error('Unexpected Email/changes response');
+		}
+
+		const result = first[1];
+		return {
+			oldState: (result.oldState as string) ?? sinceState,
+			newState: result.newState as string,
+			hasMoreChanges: !!result.hasMoreChanges,
+			created: (result.created as string[]) ?? [],
+			updated: (result.updated as string[]) ?? [],
+			destroyed: (result.destroyed as string[]) ?? []
+		};
+	}
+
+	async getMailboxChanges(sinceState: string, maxChanges = 100): Promise<JMAPChangesResult> {
+		const response = await this.request([
+			[
+				'Mailbox/changes',
+				{ accountId: this.accountId, sinceState, maxChanges },
+				'mc0'
+			]
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] === 'error') {
+			const error = first[1] as { type?: string; description?: string };
+			throw new Error(error.description ?? error.type ?? 'Mailbox/changes failed');
+		}
+		if (first?.[0] !== 'Mailbox/changes') {
+			throw new Error('Unexpected Mailbox/changes response');
+		}
+
+		const result = first[1];
+		return {
+			oldState: (result.oldState as string) ?? sinceState,
+			newState: result.newState as string,
+			hasMoreChanges: !!result.hasMoreChanges,
+			created: (result.created as string[]) ?? [],
+			updated: (result.updated as string[]) ?? [],
+			destroyed: (result.destroyed as string[]) ?? []
+		};
+	}
+
+	async getEmailsByIds(ids: string[], detail = false): Promise<JMAPEmail[]> {
+		if (!ids.length) return [];
+
+		const response = await this.request([
+			[
+				'Email/get',
+				{
+					accountId: this.accountId,
+					ids,
+					properties: detail ? [...EMAIL_DETAIL_PROPERTIES] : [...EMAIL_LIST_PROPERTIES],
+					...(detail
+						? {
+								fetchTextBodyValues: true,
+								fetchHTMLBodyValues: true,
+								maxBodyValueBytes: 256000
+							}
+						: {})
+				},
+				'eg0'
+			]
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'Email/get') return [];
+		return (first[1].list as JMAPEmail[]) ?? [];
+	}
+
+	private rewriteSessionUrl(url: string): string {
+		try {
+			const parsed = new URL(url);
+			const server = new URL(this.serverUrl);
+			if (parsed.origin === server.origin) return url;
+			const pathStart = url.indexOf('/', url.indexOf('//') + 2);
+			return server.origin + url.slice(pathStart);
+		} catch {
+			return url;
+		}
+	}
+
+	/**
+	 * Only URLs on the API's own origin are moved onto `serverUrl` (the internal
+	 * route): a server that hands blobs out from another host (Fastmail's
+	 * fastmailusercontent.com) keeps that host.
+	 */
+	private rewriteSessionUrls(session: JMAPSession): void {
+		const apiOrigin = originOf(session.apiUrl);
+		const rewrite = (url: string) => (originOf(url) === apiOrigin ? this.rewriteSessionUrl(url) : url);
+		session.apiUrl = rewrite(session.apiUrl);
+		session.downloadUrl = rewrite(session.downloadUrl);
+		if (session.uploadUrl) {
+			session.uploadUrl = rewrite(session.uploadUrl);
+		}
+		if (session.eventSourceUrl) {
+			session.eventSourceUrl = rewrite(session.eventSourceUrl);
+		}
+	}
+
+	async request(methodCalls: JMAPMethodCall[], using?: string[]): Promise<JMAPResponse> {
+		if (!this.apiUrl) {
+			throw new Error('Not connected. Call connect() first.');
+		}
+
+		const body = JSON.stringify({
+			using: using ?? ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
+			methodCalls
+		});
+
+		const send = () =>
+			this.proxyMode
+				? fetch('/api/jmap', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body
+					})
+				: this.authenticatedFetch(this.apiUrl, {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body
+					});
+
+		const response = await whenNotBusy(send);
+		const responseText = await response.text();
+		if (!response.ok) {
+			if (response.status === 401) {
+					notifyUnauthorized();
+				throw new Error('Unauthorized');
+			}
+			let detail = responseText.slice(0, 300);
+			try {
+				const parsed = JSON.parse(responseText) as { error?: string };
+				if (typeof parsed.error === 'string' && parsed.error) {
+					detail = parsed.error;
+				}
+			} catch {
+				// Use raw response text
+			}
+			if (response.status === 502) {
+				throw new Error(
+					`Mail server unavailable (502). Check that your mail server is running and reachable. ${detail}`
+				);
+			}
+			throw new Error(`Request failed: ${response.status} — ${detail}`);
+		}
+
+		return JSON.parse(responseText) as JMAPResponse;
+	}
+
+	private async calendarRequest(
+		methodCalls: JMAPMethodCall[],
+		extraUsing: string[] = []
+	): Promise<JMAPResponse> {
+		const using = extraUsing.length
+			? [...new Set([...CALENDAR_USING, ...extraUsing])]
+			: [...CALENDAR_USING];
+		return this.request(methodCalls, using);
+	}
+
+	private sortCalendars(list: JMAPCalendar[]): JMAPCalendar[] {
+		const primary = this.getCalendarAccountId();
+		return [...list].sort((a, b) => {
+			const aOwn = (a.accountId ?? primary) === primary ? 0 : 1;
+			const bOwn = (b.accountId ?? primary) === primary ? 0 : 1;
+			if (aOwn !== bOwn) return aOwn - bOwn;
+			const order = (a.sortOrder ?? 0) - (b.sortOrder ?? 0);
+			if (order !== 0) return order;
+			return a.name.localeCompare(b.name);
+		});
+	}
+
+	async getCalendars(): Promise<JMAPCalendar[]> {
+		if (!this.hasCalendars()) return [];
+
+		const accountIds = this.getCalendarAccountIds();
+		const response = await this.calendarRequest(
+			accountIds.map((accountId, index) => [
+				'Calendar/get',
+				{ accountId, properties: [...CALENDAR_PROPERTIES] },
+				`cal-${index}`
+			])
+		);
+
+		const list: JMAPCalendar[] = [];
+		const seen = new Set<string>();
+		for (const [index, accountId] of accountIds.entries()) {
+			const call = response.methodResponses?.find(([, , id]) => id === `cal-${index}`);
+			if (!call || call[0] !== 'Calendar/get') continue;
+			const calendars = (call[1].list as JMAPCalendar[]) ?? [];
+			for (const calendar of calendars) {
+				const key = `${accountId}:${calendar.id}`;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				list.push({ ...calendar, accountId });
+			}
+		}
+
+		if (!list.length) {
+			const first = response.methodResponses?.[0];
+			if (first?.[0] === 'error') {
+				const error = first[1] as { type?: string; description?: string };
+				throw new Error(error.description ?? error.type ?? 'Calendar/get failed');
+			}
+		}
+
+		return this.sortCalendars(list);
+	}
+
+	async getCalendarsByIds(
+		ids: string[],
+		accountId?: string | null
+	): Promise<JMAPCalendar[]> {
+		if (!this.hasCalendars() || !ids.length) return [];
+
+		const resolved = this.calendarAccount(accountId);
+		const response = await this.calendarRequest([
+			['Calendar/get', { accountId: resolved, ids, properties: [...CALENDAR_PROPERTIES] }, 'cal']
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'Calendar/get') {
+			throw new Error('Unexpected Calendar/get response');
+		}
+		return ((first[1].list as JMAPCalendar[]) ?? []).map((calendar) => ({
+			...calendar,
+			accountId: resolved
+		}));
+	}
+
+	async createCalendar(input: { name: string; color?: string; description?: string }): Promise<string> {
+		if (!this.hasCalendars()) throw new Error('Calendars not supported');
+
+		const trimmed = input.name.trim();
+		if (!trimmed) throw new Error('Calendar name cannot be empty');
+
+		const creationId = 'new-calendar';
+		const data: Record<string, unknown> = { name: trimmed };
+		if (input.color) data.color = input.color;
+		if (input.description?.trim()) data.description = input.description.trim();
+
+		const response = await this.calendarRequest([
+			[
+				'Calendar/set',
+				{ accountId: this.getCalendarAccountId(), create: { [creationId]: data } },
+				'ccs'
+			]
+		]);
+
+		this.throwCalendarSetErrors(response, 'Could not create calendar');
+
+		const first = response.methodResponses?.find(([name]) => name === 'Calendar/set');
+		const created = first?.[1]?.created as Record<string, { id?: string }> | undefined;
+		const id = created?.[creationId]?.id;
+		if (!id) throw new Error('Could not create calendar');
+		return id;
+	}
+
+	async updateCalendar(
+		calendarId: string,
+		patch: {
+			name?: string;
+			color?: string | null;
+			description?: string | null;
+			isVisible?: boolean;
+			shareWith?: Record<string, JMAPCalendarRights | null> | null;
+			accountId?: string | null;
+		}
+	): Promise<void> {
+		if (!this.hasCalendars()) throw new Error('Calendars not supported');
+
+		const update: Record<string, unknown> = {};
+		if (patch.name !== undefined) {
+			const trimmed = patch.name.trim();
+			if (!trimmed) throw new Error('Calendar name cannot be empty');
+			update.name = trimmed;
+		}
+		if (patch.color !== undefined) update.color = patch.color;
+		if (patch.description !== undefined) update.description = patch.description;
+		if (patch.isVisible !== undefined) update.isVisible = patch.isVisible;
+		if (patch.shareWith === null) {
+			update.shareWith = null;
+		} else if (patch.shareWith !== undefined) {
+			Object.assign(update, shareWithPointerPatch(patch.shareWith));
+		}
+
+		if (!Object.keys(update).length) return;
+
+		const response = await this.calendarRequest([
+			[
+				'Calendar/set',
+				{
+					accountId: this.calendarAccount(patch.accountId),
+					update: { [calendarId]: update }
+				},
+				'ccu'
+			]
+		]);
+
+		this.throwCalendarSetErrors(response, 'Could not update calendar');
+	}
+
+	async setDefaultCalendar(calendarId: string): Promise<void> {
+		if (!this.hasCalendars()) throw new Error('Calendars not supported');
+
+		const response = await this.calendarRequest([
+			[
+				'Calendar/set',
+				{
+					accountId: this.getCalendarAccountId(),
+					onSuccessSetIsDefault: calendarId
+				},
+				'ccd'
+			]
+		]);
+
+		this.throwCalendarSetErrors(response, 'Could not set default calendar');
+	}
+
+	async destroyCalendar(
+		calendarId: string,
+		removeEvents = false,
+		accountId?: string | null
+	): Promise<void> {
+		if (!this.hasCalendars()) throw new Error('Calendars not supported');
+
+		const response = await this.calendarRequest([
+			[
+				'Calendar/set',
+				{
+					accountId: this.calendarAccount(accountId),
+					onDestroyRemoveEvents: removeEvents,
+					destroy: [calendarId]
+				},
+				'ccx'
+			]
+		]);
+
+		this.throwCalendarSetErrors(response, 'Could not delete calendar');
+	}
+
+	private async fileNodeRequest(methodCalls: JMAPMethodCall[]): Promise<JMAPResponse> {
+		return this.request(methodCalls, [...FILENODE_USING]);
+	}
+
+	async queryFileNodes(
+		filter: Record<string, unknown>,
+		options?: { limit?: number; fetchParents?: boolean; accountId?: string | null }
+	): Promise<JMAPFileNode[]> {
+		if (!this.hasFileNode()) return [];
+
+		const accountId = this.fileNodeAccount(options?.accountId);
+		const response = await this.fileNodeRequest([
+			[
+				'FileNode/query',
+				{
+					accountId,
+					filter,
+					sort: [
+						{ property: 'nodeType', isAscending: true },
+						{ property: 'name', isAscending: true }
+					],
+					limit: options?.limit,
+					calculateTotal: false
+				},
+				'fnq'
+			],
+			[
+				'FileNode/get',
+				{
+					accountId,
+					'#ids': { resultOf: 'fnq', name: 'FileNode/query', path: '/ids' },
+					properties: [...FILE_NODE_PROPERTIES],
+					fetchParents: options?.fetchParents ?? false
+				},
+				'fng'
+			]
+		]);
+
+		assertNoMethodErrors(response, 'FileNode/query failed');
+		const getResult = response.methodResponses?.find(([name]) => name === 'FileNode/get');
+		if (getResult?.[0] !== 'FileNode/get') return [];
+		return (getResult[1].list as JMAPFileNode[]) ?? [];
+	}
+
+	async getFileNodes(
+		ids: string[],
+		fetchParents = false,
+		accountId?: string | null
+	): Promise<JMAPFileNode[]> {
+		if (!this.hasFileNode() || !ids.length) return [];
+
+		const response = await this.fileNodeRequest([
+			[
+				'FileNode/get',
+				{
+					accountId: this.fileNodeAccount(accountId),
+					ids,
+					properties: [...FILE_NODE_PROPERTIES],
+					fetchParents
+				},
+				'fng'
+			]
+		]);
+
+		assertNoMethodErrors(response, 'FileNode/get failed');
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'FileNode/get') return [];
+		return (first[1].list as JMAPFileNode[]) ?? [];
+	}
+
+	async createFileNode(input: {
+		parentId: string | null;
+		name: string;
+		nodeType?: 'file' | 'directory';
+		blobId?: string;
+		type?: string;
+		accountId?: string | null;
+	}): Promise<string> {
+		if (!this.hasFileNode()) throw new Error('File storage is not supported');
+
+		const trimmed = input.name.trim();
+		if (!trimmed) throw new Error('Name cannot be empty');
+
+		const creationId = 'new-node';
+		const data: Record<string, unknown> = {
+			name: trimmed,
+			parentId: input.parentId,
+			nodeType: input.nodeType ?? (input.blobId ? 'file' : 'directory')
+		};
+		if (input.blobId) data.blobId = input.blobId;
+		if (input.type) data.type = input.type;
+
+		const response = await this.fileNodeRequest([
+			[
+				'FileNode/set',
+				{ accountId: this.fileNodeAccount(input.accountId), create: { [creationId]: data } },
+				'fns'
+			]
+		]);
+
+		this.throwFileNodeSetErrors(response, 'Could not create file');
+
+		const first = response.methodResponses?.find(([name]) => name === 'FileNode/set');
+		const created = first?.[1]?.created as Record<string, { id?: string }> | undefined;
+		const id = created?.[creationId]?.id;
+		if (!id) throw new Error('Could not create file');
+		return id;
+	}
+
+	async updateFileNode(
+		id: string,
+		patch: {
+			name?: string;
+			parentId?: string | null;
+			blobId?: string;
+			type?: string | null;
+			shareWith?: Record<string, JMAPFileRights | null> | null;
+			accountId?: string | null;
+		}
+	): Promise<void> {
+		if (!this.hasFileNode()) throw new Error('File storage is not supported');
+
+		const update: Record<string, unknown> = {};
+		if (patch.name !== undefined) {
+			const trimmed = patch.name.trim();
+			if (!trimmed) throw new Error('Name cannot be empty');
+			update.name = trimmed;
+		}
+		if (patch.parentId !== undefined) update.parentId = patch.parentId;
+		if (patch.blobId !== undefined) update.blobId = patch.blobId;
+		if (patch.type !== undefined) update.type = patch.type;
+		if (patch.shareWith !== undefined) update.shareWith = patch.shareWith;
+		if (!Object.keys(update).length) return;
+
+		const response = await this.fileNodeRequest([
+			[
+				'FileNode/set',
+				{
+					accountId: this.fileNodeAccount(patch.accountId),
+					update: { [id]: update }
+				},
+				'fnu'
+			]
+		]);
+
+		this.throwFileNodeSetErrors(response, 'Could not update file');
+	}
+
+	async destroyFileNodes(
+		ids: string[],
+		onDestroyRemoveChildren = false,
+		accountId?: string | null
+	): Promise<void> {
+		if (!this.hasFileNode()) throw new Error('File storage is not supported');
+		if (!ids.length) return;
+
+		const response = await this.fileNodeRequest([
+			[
+				'FileNode/set',
+				{
+					accountId: this.fileNodeAccount(accountId),
+					onDestroyRemoveChildren,
+					destroy: ids
+				},
+				'fnx'
+			]
+		]);
+
+		this.throwFileNodeSetErrors(response, 'Could not delete file');
+	}
+
+	private throwFileNodeSetErrors(response: JMAPResponse, fallbackMessage: string): void {
+		for (const [methodName, result] of response.methodResponses ?? []) {
+			if (methodName === 'error' || methodName.endsWith('/error')) {
+				const failure = result as { type?: string; description?: string };
+				throw new JmapMethodError(
+					failure.type ?? 'error',
+					failure.description ?? failure.type ?? fallbackMessage
+				);
+			}
+			if (methodName !== 'FileNode/set') continue;
+
+			const buckets = [result.notCreated, result.notUpdated, result.notDestroyed];
+			for (const bucket of buckets) {
+				if (bucket && typeof bucket === 'object' && Object.keys(bucket).length) {
+					const firstError = Object.values(bucket)[0] as {
+						description?: string;
+						type?: string;
+					};
+					throw new JmapMethodError(
+						firstError?.type ?? 'error',
+						firstError?.description ?? firstError?.type ?? fallbackMessage
+					);
+				}
+			}
+		}
+	}
+
+	/* ── Contacts (RFC 9610) ──────────────────────────────────────────── */
+
+	hasContacts(): boolean {
+		if (this.session?.capabilities?.[CONTACTS_URN]) return true;
+		const accountId = this.getContactAccountId();
+		return !!this.session?.accounts?.[accountId]?.accountCapabilities?.[CONTACTS_URN];
+	}
+
+	getContactAccountId(): string {
+		return this.session?.primaryAccounts?.[CONTACTS_URN] ?? this.accountId;
+	}
+
+	/** Own contacts account plus any shared accounts advertised on the session. */
+	getContactAccountIds(): string[] {
+		const primary = this.getContactAccountId();
+		const ids = new Set<string>();
+		if (primary) ids.add(primary);
+		for (const [id, account] of Object.entries(this.session?.accounts ?? {})) {
+			if (account.accountCapabilities?.[CONTACTS_URN]) ids.add(id);
+		}
+		return [...ids];
+	}
+
+	private contactAccount(accountId?: string | null): string {
+		return accountId || this.getContactAccountId();
+	}
+
+	private async contactRequest(methodCalls: JMAPMethodCall[]): Promise<JMAPResponse> {
+		return this.request(methodCalls, [...CONTACTS_USING]);
+	}
+
+	async getAddressBooks(): Promise<JMAPAddressBook[]> {
+		if (!this.hasContacts()) return [];
+		const accountIds = this.getContactAccountIds();
+		const response = await this.contactRequest(
+			accountIds.map((accountId, index) => [
+				'AddressBook/get',
+				{ accountId, properties: [...ADDRESS_BOOK_PROPERTIES] },
+				`ab-${index}`
+			])
+		);
+		const list: JMAPAddressBook[] = [];
+		for (const [index, accountId] of accountIds.entries()) {
+			const call = response.methodResponses?.find(([, , id]) => id === `ab-${index}`);
+			if (call?.[0] === 'error' && accountIds.length === 1) {
+				const error = call[1] as { type?: string; description?: string };
+				throw new JmapMethodError(error.type ?? 'error', error.description ?? error.type ?? 'AddressBook/get failed');
+			}
+			if (call?.[0] !== 'AddressBook/get') continue;
+			for (const book of (call[1].list as JMAPAddressBook[]) ?? []) {
+				list.push({ ...book, accountId });
+			}
+		}
+		const primary = this.getContactAccountId();
+		return list.sort((a, b) => {
+			const aOwn = (a.accountId ?? primary) === primary ? 0 : 1;
+			const bOwn = (b.accountId ?? primary) === primary ? 0 : 1;
+			return aOwn - bOwn || Number(!!b.isDefault) - Number(!!a.isDefault) || (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name);
+		});
+	}
+
+	async createAddressBook(input: { name: string; accountId?: string | null }): Promise<string> {
+		const accountId = this.contactAccount(input.accountId);
+		const response = await this.contactRequest([
+			['AddressBook/set', { accountId, create: { book: { name: input.name } } }, 'abs']
+		]);
+		this.throwOnSetErrors(response, 'Could not create the address book');
+		const first = response.methodResponses?.[0];
+		const created = first?.[1].created as Record<string, { id?: string }> | undefined;
+		const id = created?.book?.id;
+		if (!id) throw new Error('Could not create the address book');
+		return id;
+	}
+
+	/**
+	 * Every card the account can see, across own and shared address books,
+	 * paged through `ContactCard/query` in server-sized chunks (Stalwart caps a
+	 * `get` at 500 ids). `limit` bounds the total so a huge shared directory
+	 * cannot pin the server; autocomplete does not need all of it.
+	 */
+	async getContactCards(options: {
+		addressBookId?: string;
+		limit?: number;
+		accountId?: string | null;
+	} = {}): Promise<JMAPContactCard[]> {
+		if (!this.hasContacts()) return [];
+		const accountIds = options.accountId
+			? [this.contactAccount(options.accountId)]
+			: this.getContactAccountIds();
+		const cap = Math.max(1, options.limit ?? 2000);
+		const page = 250;
+		const cards: JMAPContactCard[] = [];
+
+		for (const accountId of accountIds) {
+			let position = 0;
+			while (cards.length < cap) {
+				const filter = options.addressBookId ? { inAddressBook: options.addressBookId } : {};
+				const response = await this.contactRequest([
+					[
+						'ContactCard/query',
+						{ accountId, filter, sort: [{ property: 'name/surname' }, { property: 'name/given' }], position, limit: Math.min(page, cap - cards.length), calculateTotal: false },
+						'ccq'
+					],
+					[
+						'ContactCard/get',
+						{
+							accountId,
+							'#ids': { resultOf: 'ccq', name: 'ContactCard/query', path: '/ids' },
+							properties: [...CONTACT_CARD_PROPERTIES]
+						},
+						'ccg'
+					]
+				]);
+				const query = response.methodResponses?.find(([, , id]) => id === 'ccq');
+				if (query?.[0] === 'error') {
+					const error = query[1] as { type?: string; description?: string };
+					// A sort the server does not support is not worth failing over.
+					if (error.type === 'unsupportedSort' && position === 0) {
+						return this.getContactCardsUnsorted(accountIds, options.addressBookId, cap);
+					}
+					if (accountIds.length === 1) {
+						throw new JmapMethodError(error.type ?? 'error', error.description ?? error.type ?? 'ContactCard/query failed');
+					}
+					break;
+				}
+				const get = response.methodResponses?.find(([, , id]) => id === 'ccg');
+				const list = get?.[0] === 'ContactCard/get' ? ((get[1].list as JMAPContactCard[]) ?? []) : [];
+				for (const card of list) cards.push({ ...card, accountId });
+				const ids = (query?.[1].ids as string[] | undefined) ?? [];
+				if (ids.length < Math.min(page, cap - cards.length + ids.length) || ids.length === 0) break;
+				position += ids.length;
+			}
+		}
+		return cards;
+	}
+
+	private async getContactCardsUnsorted(
+		accountIds: string[],
+		addressBookId: string | undefined,
+		cap: number
+	): Promise<JMAPContactCard[]> {
+		const cards: JMAPContactCard[] = [];
+		for (const accountId of accountIds) {
+			const filter = addressBookId ? { inAddressBook: addressBookId } : {};
+			const response = await this.contactRequest([
+				['ContactCard/query', { accountId, filter, limit: cap - cards.length }, 'ccq'],
+				[
+					'ContactCard/get',
+					{
+						accountId,
+						'#ids': { resultOf: 'ccq', name: 'ContactCard/query', path: '/ids' },
+						properties: [...CONTACT_CARD_PROPERTIES]
+					},
+					'ccg'
+				]
+			]);
+			const get = response.methodResponses?.find(([, , id]) => id === 'ccg');
+			if (get?.[0] !== 'ContactCard/get') continue;
+			for (const card of (get[1].list as JMAPContactCard[]) ?? []) cards.push({ ...card, accountId });
+		}
+		return cards;
+	}
+
+	async getContactCard(id: string, accountId?: string | null): Promise<JMAPContactCard | null> {
+		if (!this.hasContacts()) return null;
+		const resolved = this.contactAccount(accountId);
+		const response = await this.contactRequest([
+			['ContactCard/get', { accountId: resolved, ids: [id], properties: [...CONTACT_CARD_PROPERTIES] }, 'ccg']
+		]);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'ContactCard/get') return null;
+		const card = ((first[1].list as JMAPContactCard[]) ?? [])[0];
+		return card ? { ...card, accountId: resolved } : null;
+	}
+
+	/** `card` is a whole JSContact Card with `addressBookIds` (see `buildContactCard`). */
+	async createContactCard(card: Record<string, unknown>, accountId?: string | null): Promise<string> {
+		if (!this.hasContacts()) throw new Error('Contacts are not supported by this server');
+		const resolved = this.contactAccount(accountId);
+		const response = await this.contactRequest([
+			['ContactCard/set', { accountId: resolved, create: { card } }, 'ccs']
+		]);
+		this.throwOnSetErrors(response, 'Could not save the contact');
+		const first = response.methodResponses?.[0];
+		const created = first?.[1].created as Record<string, { id?: string }> | undefined;
+		const id = created?.card?.id;
+		if (!id) throw new Error('Could not save the contact');
+		return id;
+	}
+
+	/** `patch` is a JMAP patch object (see `buildContactPatch`). */
+	async updateContactCard(
+		id: string,
+		patch: Record<string, unknown>,
+		accountId?: string | null
+	): Promise<void> {
+		if (!this.hasContacts()) throw new Error('Contacts are not supported by this server');
+		const response = await this.contactRequest([
+			['ContactCard/set', { accountId: this.contactAccount(accountId), update: { [id]: patch } }, 'ccu']
+		]);
+		this.throwOnSetErrors(response, 'Could not save the contact');
+	}
+
+	async destroyContactCard(id: string, accountId?: string | null): Promise<void> {
+		if (!this.hasContacts()) throw new Error('Contacts are not supported by this server');
+		const response = await this.contactRequest([
+			['ContactCard/set', { accountId: this.contactAccount(accountId), destroy: [id] }, 'ccd']
+		]);
+		this.throwOnSetErrors(response, 'Could not delete the contact');
+	}
+
+	async queryPrincipals(query: string): Promise<JMAPPrincipal[]> {
+		if (!this.hasPrincipals()) {
+			throw new Error('Sharing is not supported by this server');
+		}
+
+		const trimmed = query.trim();
+		if (!trimmed) return [];
+
+		const accountId = this.getPrincipalAccountId();
+		const filter: Record<string, string> = trimmed.includes('@')
+			? { email: trimmed }
+			: { text: trimmed };
+
+		const list = await this.runPrincipalQuery(accountId, filter);
+		if (list.length || !trimmed.includes('@')) return list;
+
+		return this.runPrincipalQuery(accountId, { text: trimmed });
+	}
+
+	async getPrincipals(ids: string[]): Promise<JMAPPrincipal[]> {
+		if (!this.hasPrincipals() || !ids.length) return [];
+
+		const response = await this.request(
+			[
+				[
+					'Principal/get',
+					{
+						accountId: this.getPrincipalAccountId(),
+						ids,
+						properties: ['id', 'type', 'name', 'email', 'description']
+					},
+					'pg'
+				]
+			],
+			[...PRINCIPAL_USING]
+		);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] === 'error') {
+			const error = first[1] as { type?: string; description?: string };
+			throw new JmapMethodError(
+				error.type ?? 'error',
+				error.description ?? error.type ?? 'Could not load people'
+			);
+		}
+		if (first?.[0] !== 'Principal/get') return [];
+		return (first[1].list as JMAPPrincipal[]) ?? [];
+	}
+
+	private async runPrincipalQuery(
+		accountId: string,
+		filter: Record<string, string>
+	): Promise<JMAPPrincipal[]> {
+		const response = await this.request(
+			[
+				['Principal/query', { accountId, filter, limit: 20 }, 'pq'],
+				[
+					'Principal/get',
+					{
+						accountId,
+						'#ids': { resultOf: 'pq', name: 'Principal/query', path: '/ids' },
+						properties: ['id', 'type', 'name', 'email', 'description']
+					},
+					'pg'
+				]
+			],
+			[...PRINCIPAL_USING]
+		);
+
+		const queryResult = response.methodResponses?.[0];
+		if (queryResult?.[0] === 'error') {
+			const error = queryResult[1] as { type?: string; description?: string };
+			throw new JmapMethodError(
+				error.type ?? 'error',
+				error.description ?? error.type ?? 'Could not look up people on this server'
+			);
+		}
+
+		const getResult = response.methodResponses?.[1];
+		if (getResult?.[0] !== 'Principal/get') return [];
+		return (getResult[1].list as JMAPPrincipal[]) ?? [];
+	}
+
+	/**
+	 * Storage quota (octets) for the account, or null when the server does not
+	 * advertise the JMAP Quota extension or exposes no usable storage limit.
+	 */
+	async getStorageQuota(): Promise<{ used: number; limit: number } | null> {
+		if (!this.hasQuota()) return null;
+
+		const response = await this.request(
+			[['Quota/get', { accountId: this.accountId, ids: null }, 'q']],
+			[...QUOTA_USING]
+		);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'Quota/get') return null;
+
+		const list = (first[1].list as JMAPQuota[]) ?? [];
+		// Storage is the octets quota; ignore object-count quotas. Stalwart can
+		// expose per-user, per-domain and global quotas, so prefer account scope.
+		const octets = list.filter((quota) => quota.resourceType === 'octets');
+		const storage = octets.find((quota) => quota.scope === 'account') ?? octets[0];
+		if (!storage) return null;
+
+		const limit = storage.hardLimit ?? storage.softLimit ?? storage.warnLimit ?? null;
+		if (typeof limit !== 'number' || limit <= 0) return null;
+
+		return { used: storage.used ?? 0, limit };
+	}
+
+	/**
+	 * The account's vacation auto-reply (RFC 8621 §8 singleton), or null when the
+	 * server does not advertise the capability.
+	 */
+	async getVacationResponse(): Promise<JMAPVacationResponse | null> {
+		if (!this.hasVacationResponse()) return null;
+
+		const response = await this.request(
+			[['VacationResponse/get', { accountId: this.accountId, ids: null }, 'v']],
+			[...VACATION_USING]
+		);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'VacationResponse/get') {
+			const error = first?.[1] as { type?: string; description?: string } | undefined;
+			throw new Error(error?.description ?? error?.type ?? 'VacationResponse/get failed');
+		}
+
+		const list = (first[1].list as JMAPVacationResponse[]) ?? [];
+		return list[0] ?? null;
+	}
+
+	/** Patch the vacation singleton; only the provided fields change. */
+	async setVacationResponse(
+		update: Partial<Omit<JMAPVacationResponse, 'id'>>
+	): Promise<void> {
+		if (!this.hasVacationResponse()) {
+			throw new Error('Vacation responses are not supported by this server');
+		}
+
+		const response = await this.request(
+			[
+				[
+					'VacationResponse/set',
+					{ accountId: this.accountId, update: { singleton: update } },
+					'v'
+				]
+			],
+			[...VACATION_USING]
+		);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'VacationResponse/set') {
+			const error = first?.[1] as { type?: string; description?: string } | undefined;
+			throw new Error(error?.description ?? error?.type ?? 'VacationResponse/set failed');
+		}
+		const result = first[1] as {
+			notUpdated?: Record<string, { type?: string; description?: string }>;
+		};
+		const rejection = result.notUpdated?.singleton;
+		if (rejection) {
+			throw new Error(rejection.description ?? rejection.type ?? 'Vacation response rejected');
+		}
+	}
+
+	/**
+	 * Sieve scripts on the account (RFC 9661). Metadata only — the script body
+	 * is a blob, which `getSieveScriptSource` fetches.
+	 */
+	async getSieveScripts(): Promise<JMAPSieveScript[]> {
+		if (!this.hasSieve()) return [];
+		const response = await this.request(
+			[['SieveScript/get', { accountId: this.accountId, ids: null }, 's']],
+			[...SIEVE_USING]
+		);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'SieveScript/get') {
+			const error = first?.[1] as { type?: string; description?: string } | undefined;
+			throw new Error(error?.description ?? error?.type ?? 'SieveScript/get failed');
+		}
+		return ((first[1].list as JMAPSieveScript[]) ?? []).filter(Boolean);
+	}
+
+	async getSieveScriptSource(blobId: string): Promise<string> {
+		const response = await this.downloadBlob(blobId, 'script.sieve', SIEVE_MEDIA_TYPE);
+		if (!response.ok) throw new Error(`Could not download the script (${response.status})`);
+		return response.text();
+	}
+
+	/**
+	 * Store a script and make it the active one.
+	 *
+	 * RFC 9661 has no inline content: the body is uploaded as a blob first, then
+	 * referenced by id. It is validated before it is stored, because a script
+	 * the server accepts but cannot run would silently stop filtering mail —
+	 * `SieveScript/validate` is the only way to find out without risking that.
+	 *
+	 * `onSuccessActivateScript` activates it in the same call, so there is no
+	 * window where the rules exist but nothing is filtering.
+	 */
+	async saveSieveScript(input: {
+		/** Omit to create; pass an existing id to replace that script's content. */
+		id?: string;
+		name: string;
+		source: string;
+	}): Promise<string> {
+		if (!this.hasSieve()) {
+			throw new Error('This server does not support mail rules');
+		}
+
+		const { blobId } = await this.uploadBlob(
+			new TextEncoder().encode(input.source).buffer as ArrayBuffer,
+			SIEVE_MEDIA_TYPE
+		);
+
+		const invalid = await this.validateSieveScript(blobId);
+		if (invalid) throw new Error(invalid);
+
+		const creationId = 'script';
+		const call = input.id
+			? { accountId: this.accountId, update: { [input.id]: { blobId } } }
+			: {
+					accountId: this.accountId,
+					create: { [creationId]: { name: input.name, blobId } }
+				};
+
+		const response = await this.request(
+			[
+				[
+					'SieveScript/set',
+					{ ...call, onSuccessActivateScript: input.id ?? `#${creationId}` },
+					's'
+				]
+			],
+			[...SIEVE_USING]
+		);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'SieveScript/set') {
+			const error = first?.[1] as { type?: string; description?: string } | undefined;
+			throw new Error(error?.description ?? error?.type ?? 'SieveScript/set failed');
+		}
+		const result = first[1] as {
+			created?: Record<string, { id?: string }>;
+			notCreated?: Record<string, { type?: string; description?: string }>;
+			notUpdated?: Record<string, { type?: string; description?: string }>;
+		};
+		const rejection =
+			result.notCreated?.[creationId] ?? (input.id ? result.notUpdated?.[input.id] : undefined);
+		if (rejection) {
+			throw new Error(rejection.description ?? rejection.type ?? 'The server rejected the rules');
+		}
+		return input.id ?? result.created?.[creationId]?.id ?? '';
+	}
+
+	/** `null` when the script is valid; otherwise why it is not. */
+	async validateSieveScript(blobId: string): Promise<string | null> {
+		const response = await this.request(
+			[['SieveScript/validate', { accountId: this.accountId, blobId }, 'v']],
+			[...SIEVE_USING]
+		);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'SieveScript/validate') {
+			const error = first?.[1] as { type?: string; description?: string } | undefined;
+			throw new Error(error?.description ?? error?.type ?? 'SieveScript/validate failed');
+		}
+		const error = (first[1] as { error?: { type?: string; description?: string } | null }).error;
+		if (!error) return null;
+		return error.description ?? error.type ?? 'The script is not valid Sieve';
+	}
+
+	async destroySieveScript(id: string): Promise<void> {
+		const response = await this.request(
+			[['SieveScript/set', { accountId: this.accountId, destroy: [id] }, 's']],
+			[...SIEVE_USING]
+		);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'SieveScript/set') {
+			const error = first?.[1] as { type?: string; description?: string } | undefined;
+			throw new Error(error?.description ?? error?.type ?? 'SieveScript/set failed');
+		}
+		const rejection = (
+			first[1] as { notDestroyed?: Record<string, { type?: string; description?: string }> }
+		).notDestroyed?.[id];
+		if (rejection) {
+			throw new Error(rejection.description ?? rejection.type ?? 'Could not delete the script');
+		}
+	}
+
+	async queryCalendarEvents(params: {
+		after: string;
+		before: string;
+		calendarId?: string;
+		timeZone?: string;
+		accountId?: string | null;
+		/**
+		 * Ask the server to expand recurring events into instances inside the
+		 * range (JMAP Calendars `expandRecurrences`). Instances come back with
+		 * synthetic ids carrying `baseEventId` + `recurrenceId`. Off by default
+		 * because webmail 1.0 expands client-side.
+		 */
+		expandRecurrences?: boolean;
+	}): Promise<CalendarEventQueryResult> {
+		if (!this.hasCalendars()) return { events: [], total: 0 };
+
+		const accountIds = params.accountId
+			? [this.calendarAccount(params.accountId)]
+			: this.getCalendarAccountIds();
+		const filter: Record<string, string> = {
+			after: params.after,
+			before: params.before
+		};
+		if (params.calendarId) filter.inCalendar = params.calendarId;
+
+		const methodCalls: JMAPMethodCall[] = [];
+		for (const [index, accountId] of accountIds.entries()) {
+			methodCalls.push(
+				[
+					'CalendarEvent/query',
+					{
+						accountId,
+						filter,
+						expandRecurrences: params.expandRecurrences === true,
+						timeZone: params.timeZone ?? 'Etc/UTC',
+						limit: 500
+					},
+					`ceq-${index}`
+				],
+				[
+					'CalendarEvent/get',
+					{
+						accountId,
+						'#ids': {
+							resultOf: `ceq-${index}`,
+							name: 'CalendarEvent/query',
+							path: '/ids'
+						},
+						properties: [...CALENDAR_EVENT_PROPERTIES]
+					},
+					`ceg-${index}`
+				]
+			);
+		}
+
+		const response = await this.calendarRequest(methodCalls);
+		const events: JMAPCalendarEvent[] = [];
+		let total = 0;
+		let sawQueryError: { type?: string; description?: string } | null = null;
+
+		for (const [index, accountId] of accountIds.entries()) {
+			const queryResult = response.methodResponses?.find(([, , id]) => id === `ceq-${index}`);
+			if (queryResult?.[0] === 'error') {
+				sawQueryError = queryResult[1] as { type?: string; description?: string };
+				continue;
+			}
+			const getResult = response.methodResponses?.find(([, , id]) => id === `ceg-${index}`);
+			if (getResult?.[0] !== 'CalendarEvent/get') continue;
+			const list = (getResult[1].list as JMAPCalendarEvent[]) ?? [];
+			total += (queryResult?.[1]?.total as number) ?? list.length;
+			for (const event of list) {
+				events.push({ ...event, accountId });
+			}
+		}
+
+		if (!events.length && sawQueryError && accountIds.length === 1) {
+			throw new Error(
+				sawQueryError.description ?? sawQueryError.type ?? 'CalendarEvent/query failed'
+			);
+		}
+
+		return { events, total };
+	}
+
+	async getCalendarEvent(
+		eventId: string,
+		accountId?: string | null
+	): Promise<JMAPCalendarEvent | null> {
+		if (!this.hasCalendars()) return null;
+
+		const resolved = this.calendarAccount(accountId);
+		const response = await this.calendarRequest([
+			[
+				'CalendarEvent/get',
+				{
+					accountId: resolved,
+					ids: [eventId],
+					properties: [...CALENDAR_EVENT_PROPERTIES]
+				},
+				'ce0'
+			]
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'CalendarEvent/get') return null;
+		const list = (first[1].list as JMAPCalendarEvent[]) ?? [];
+		const event = list[0];
+		return event ? { ...event, accountId: resolved } : null;
+	}
+
+	private buildCalendarEventData(
+		input: {
+			calendarId: string;
+			title: string;
+			start: string;
+			duration: string;
+			timeZone: string;
+			showWithoutTime: boolean;
+			description?: string;
+			location?: string;
+			previousCalendarIds?: string[];
+			recurrenceRule?: JmapRecurrenceRule | null;
+			occurrence?: boolean;
+		},
+		mode: 'create' | 'update'
+	): Record<string, unknown> {
+		const eventData: Record<string, unknown> = {
+			title: input.title,
+			start: input.start,
+			duration: input.duration,
+			timeZone: input.timeZone,
+			showWithoutTime: input.showWithoutTime
+		};
+
+		// Which calendars an event is filed in belongs to the series, not to one
+		// of its instances, and the server refuses the property on an override:
+		// "This property cannot be modified on a single occurrence." Nothing is
+		// lost by leaving it out — an occurrence cannot be filed anywhere its
+		// series is not, and no caller offers to move one.
+		//
+		// Sent only when the calendar actually changed. An event can be filed in
+		// several calendars at once; callers offer one, so writing the property
+		// on an edit that never touched it — a retitle, a drag — would quietly
+		// unfile the event from all the others.
+		const previousCalendarIds = input.previousCalendarIds ?? [];
+		if (!input.occurrence && !previousCalendarIds.includes(input.calendarId)) {
+			const calendarIds: Record<string, boolean | null> = { [input.calendarId]: true };
+			for (const id of previousCalendarIds) calendarIds[id] = null;
+			eventData.calendarIds = calendarIds;
+		}
+
+		if (mode === 'create') {
+			eventData['@type'] = 'Event';
+			eventData.uid = crypto.randomUUID();
+			eventData.useDefaultAlerts = true;
+		}
+
+		if (input.description) {
+			eventData.description = input.description;
+		} else if (mode === 'update') {
+			eventData.description = null;
+		}
+
+		if (input.location) {
+			eventData.locations = {
+				'1': { '@type': 'Location', name: input.location }
+			};
+		} else if (mode === 'update') {
+			eventData.locations = null;
+		}
+
+		// `undefined` leaves the rule alone — an occurrence override must not
+		// touch the series it belongs to. `null` is what turns repeating off;
+		// without it a rule could be set but never cleared.
+		if (input.recurrenceRule !== undefined) {
+			eventData.recurrenceRule = input.recurrenceRule;
+		}
+
+		return eventData;
+	}
+
+	async createCalendarEvent(input: {
+		calendarId: string;
+		title: string;
+		start: string;
+		duration: string;
+		timeZone: string;
+		showWithoutTime: boolean;
+		description?: string;
+		location?: string;
+		recurrenceRule?: JmapRecurrenceRule | null;
+		accountId?: string | null;
+	}): Promise<string> {
+		if (!this.hasCalendars()) throw new Error('Calendars not supported');
+
+		const accountId = this.calendarAccount(input.accountId);
+		const createKey = `evt-${Date.now()}`;
+
+		const response = await this.calendarRequest([
+			[
+				'CalendarEvent/set',
+				{
+					accountId,
+					create: { [createKey]: this.buildCalendarEventData(input, 'create') }
+				},
+				'ces'
+			]
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] === 'error') {
+			const error = first[1] as { type?: string; description?: string };
+			throw new Error(error.description ?? error.type ?? 'Failed to create event');
+		}
+		if (first?.[0] !== 'CalendarEvent/set') {
+			throw new Error('Unexpected CalendarEvent/set response');
+		}
+
+		const result = first[1];
+		const created = result.created as Record<string, { id?: string }> | undefined;
+		const notCreated = result.notCreated as
+			| Record<string, { description?: string; type?: string }>
+			| undefined;
+
+		if (notCreated && Object.keys(notCreated).length) {
+			const firstError = Object.values(notCreated)[0];
+			throw new Error(firstError?.description ?? firstError?.type ?? 'Failed to create event');
+		}
+
+		const id = created?.[createKey]?.id;
+		if (!id) throw new Error('Failed to create event');
+		return id;
+	}
+
+	async updateCalendarEvent(
+		eventId: string,
+		input: {
+			calendarId: string;
+			title: string;
+			start: string;
+			duration: string;
+			timeZone: string;
+			showWithoutTime: boolean;
+			description?: string;
+			location?: string;
+			previousCalendarIds?: string[];
+			recurrenceRule?: JmapRecurrenceRule | null;
+			accountId?: string | null;
+			/** `eventId` is one occurrence of a series, so the patch is an
+			 *  override and may carry only what an occurrence owns. */
+			occurrence?: boolean;
+		}
+	): Promise<void> {
+		if (!this.hasCalendars()) throw new Error('Calendars not supported');
+
+		const response = await this.calendarRequest([
+			[
+				'CalendarEvent/set',
+				{
+					accountId: this.calendarAccount(input.accountId),
+					update: { [eventId]: this.buildCalendarEventData(input, 'update') }
+				},
+				'ceu'
+			]
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] === 'error') {
+			const error = first[1] as { type?: string; description?: string };
+			throw new Error(error.description ?? error.type ?? 'Failed to update event');
+		}
+		if (first?.[0] !== 'CalendarEvent/set') {
+			throw new Error('Unexpected CalendarEvent/set response');
+		}
+
+		const notUpdated = first[1].notUpdated as
+			| Record<string, { description?: string; type?: string; properties?: string[] }>
+			| undefined;
+		if (notUpdated && Object.keys(notUpdated).length) {
+			const firstError = Object.values(notUpdated)[0];
+			// The property names ride along: a SetError that only says a property
+			// was refused, without naming it, is a bug report nobody can act on.
+			const where = firstError?.properties?.length ? ` (${firstError.properties.join(', ')})` : '';
+			throw new Error(
+				`${firstError?.description ?? firstError?.type ?? 'Failed to update event'}${where}`
+			);
+		}
+	}
+
+	async destroyCalendarEvent(eventId: string, accountId?: string | null): Promise<void> {
+		if (!this.hasCalendars()) throw new Error('Calendars not supported');
+
+		const response = await this.calendarRequest([
+			[
+				'CalendarEvent/set',
+				{
+					accountId: this.calendarAccount(accountId),
+					destroy: [eventId]
+				},
+				'ced'
+			]
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] === 'error') {
+			const error = first[1] as { type?: string; description?: string };
+			throw new Error(error.description ?? error.type ?? 'Failed to delete event');
+		}
+		if (first?.[0] !== 'CalendarEvent/set') {
+			throw new Error('Unexpected CalendarEvent/set response');
+		}
+
+		const notDestroyed = first[1].notDestroyed as
+			| Record<string, { description?: string; type?: string }>
+			| undefined;
+		if (notDestroyed && Object.keys(notDestroyed).length) {
+			const firstError = Object.values(notDestroyed)[0];
+			throw new Error(firstError?.description ?? firstError?.type ?? 'Failed to delete event');
+		}
+	}
+
+	async getMailboxes(): Promise<JMAPMailbox[]> {
+		const response = await this.request([['Mailbox/get', { accountId: this.accountId }, 'mb']]);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] === 'error') {
+			const error = first[1] as { type?: string; description?: string };
+			throw new Error(error.description ?? error.type ?? 'Mailbox/get failed');
+		}
+		if (first?.[0] !== 'Mailbox/get') {
+			throw new Error('Unexpected Mailbox/get response');
+		}
+		return (first[1].list as JMAPMailbox[]) ?? [];
+	}
+
+	async getMailboxesByIds(ids: string[]): Promise<JMAPMailbox[]> {
+		if (!ids.length) return [];
+
+		const response = await this.request([
+			['Mailbox/get', { accountId: this.accountId, ids }, 'mb']
+		]);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'Mailbox/get') {
+			throw new Error('Unexpected Mailbox/get response');
+		}
+		return (first[1].list as JMAPMailbox[]) ?? [];
+	}
+
+	async renameMailbox(mailboxId: string, name: string): Promise<void> {
+		const trimmed = name.trim();
+		if (!trimmed) throw new Error('Folder name cannot be empty');
+		await this.updateMailbox(mailboxId, { name: trimmed });
+	}
+
+	/** Rename and/or move a mailbox; `parentId: null` makes it top-level. */
+	async updateMailbox(
+		mailboxId: string,
+		patch: { name?: string; parentId?: string | null }
+	): Promise<void> {
+		const response = await this.request([
+			['Mailbox/set', { accountId: this.accountId, update: { [mailboxId]: patch } }, 'mbr']
+		]);
+		this.throwOnSetErrors(response, 'Could not change folder');
+	}
+
+	/** Who each folder is shared with, by principal id (RFC 9670 `shareWith`). */
+	async getMailboxShares(): Promise<{ id: string; shareWith: Record<string, JMAPMailboxRights> }[]> {
+		const response = await this.request(
+			[['Mailbox/get', { accountId: this.accountId, properties: ['id', 'shareWith'] }, 'mbs']],
+			MAILBOX_SHARE_USING
+		);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'Mailbox/get') throw new Error('Could not load who the mailbox is shared with');
+		return ((first[1].list as { id: string; shareWith?: Record<string, JMAPMailboxRights> | null }[]) ?? []).map(
+			(box) => ({ id: box.id, shareWith: box.shareWith ?? {} })
+		);
+	}
+
+	/**
+	 * Share every folder with a person, or with `rights: null` take them off.
+	 * Stalwart shares per folder, so a whole mailbox is every folder at once;
+	 * one made afterwards is not shared until this runs again.
+	 */
+	async shareMailboxes(principalId: string, rights: JMAPMailboxRights | null): Promise<void> {
+		const boxes = await this.getMailboxes();
+		const update = Object.fromEntries(boxes.map((box) => [box.id, { [`shareWith/${principalId}`]: rights }]));
+		const response = await this.request(
+			[['Mailbox/set', { accountId: this.accountId, update }, 'mbs']],
+			MAILBOX_SHARE_USING
+		);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] === 'error') throw new Error(String(first[1].description ?? first[1].type ?? 'Sharing failed'));
+		this.throwOnSetErrors(response, 'Could not change who the mailbox is shared with');
+	}
+
+	/**
+	 * Copy blobs from another account into this one (RFC 8620 §6.3) — an
+	 * attachment forwarded out of a shared mailbox has to be yours to send.
+	 * Returns old id → new id for the ones that copied.
+	 */
+	async copyBlobs(fromAccountId: string, blobIds: string[]): Promise<Record<string, string>> {
+		if (!blobIds.length) return {};
+		const response = await this.request([
+			['Blob/copy', { fromAccountId, accountId: this.accountId, blobIds }, 'bc']
+		]);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'Blob/copy') throw new Error('Could not copy the attachments');
+		return (first[1].copied as Record<string, string> | null) ?? {};
+	}
+
+	async createMailbox(name: string, parentId?: string | null): Promise<string> {
+		const trimmed = name.trim();
+		if (!trimmed) throw new Error('Folder name cannot be empty');
+
+		const creationId = 'new-folder';
+		const data: { name: string; parentId?: string } = { name: trimmed };
+		if (parentId) data.parentId = parentId;
+
+		const response = await this.request([
+			[
+				'Mailbox/set',
+				{ accountId: this.accountId, create: { [creationId]: data } },
+				'mbc'
+			]
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] === 'error') {
+			const error = first[1] as { type?: string; description?: string };
+			throw new Error(error.description ?? error.type ?? 'Could not create folder');
+		}
+		if (first?.[0] !== 'Mailbox/set') {
+			throw new Error('Unexpected Mailbox/set response');
+		}
+
+		this.throwOnSetErrors(response, 'Could not create folder');
+
+		const created = first[1].created as Record<string, { id: string }> | undefined;
+		const id = created?.[creationId]?.id;
+		if (!id) throw new Error('Could not create folder');
+		return id;
+	}
+
+	/**
+	 * Destroy a mailbox. With `removeEmails`, JMAP also destroys mail that lives *only* in this
+	 * mailbox (permanently); without it, the server refuses a non-empty mailbox. A mailbox with
+	 * child mailboxes can't be destroyed until its children are.
+	 */
+	async destroyMailbox(mailboxId: string, removeEmails = false): Promise<void> {
+		const response = await this.request([
+			[
+				'Mailbox/set',
+				{ accountId: this.accountId, onDestroyRemoveEmails: removeEmails, destroy: [mailboxId] },
+				'mbd'
+			]
+		]);
+		this.throwOnSetErrors(response, 'Could not delete folder');
+
+		const result = response.methodResponses?.[0]?.[1];
+		const notDestroyed = result?.notDestroyed as
+			| Record<string, { description?: string; type?: string }>
+			| undefined;
+		const failure = notDestroyed?.[mailboxId];
+		if (failure) {
+			if (failure.type === 'mailboxHasChild') {
+				throw new Error('Delete the subfolders inside this folder first');
+			}
+			throw new Error(failure.description ?? failure.type ?? 'Could not delete folder');
+		}
+	}
+
+	/**
+	 * The account's send-as identities. Stalwart (0.16.21+) can leave an account
+	 * with none at all, and then every submission fails "Identity not found" —
+	 * so an empty list gets the primary address created on the spot.
+	 */
+	async getIdentities(): Promise<JMAPIdentity[]> {
+		const list = await this.readIdentities();
+		if (list.length || !this.username.includes('@')) return list;
+		return this.createIdentities([{ email: this.username, name: '' }]);
+	}
+
+	private async readIdentities(): Promise<JMAPIdentity[]> {
+		const response = await this.request(
+			[['Identity/get', { accountId: this.accountId }, 'id']],
+			['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+		);
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'Identity/get') {
+			return [];
+		}
+		return (first[1].list as JMAPIdentity[]) ?? [];
+	}
+
+	/** Create identities (best effort — the server refuses foreign addresses) and return the list after. */
+	private async createIdentities(list: Omit<JMAPIdentity, 'id'>[]): Promise<JMAPIdentity[]> {
+		const create = Object.fromEntries(list.map((identity, n) => [`i${n}`, identity]));
+		const response = await this.request(
+			[
+				['Identity/set', { accountId: this.accountId, create }, 'ic'],
+				['Identity/get', { accountId: this.accountId }, 'ig']
+			],
+			['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+		);
+		const got = response.methodResponses?.find(([name]) => name === 'Identity/get');
+		return (got?.[1].list as JMAPIdentity[]) ?? [];
+	}
+
+	/**
+	 * Force the server to rebuild the send-as identity list from the account's
+	 * current addresses. Stalwart only synthesizes identities when an account has
+	 * none stored, so aliases added after first login never show up until the
+	 * stale identities are destroyed and regenerated (stalwart#1475).
+	 */
+	async resyncIdentities(): Promise<JMAPIdentity[]> {
+		const before = await this.getIdentities();
+
+		if (before.length) {
+			const response = await this.request(
+				[
+					[
+						'Identity/set',
+						{ accountId: this.accountId, destroy: before.map((identity) => identity.id) },
+						'ids'
+					]
+				],
+				['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+			);
+			this.throwOnSetErrors(response, 'Could not refresh send-from addresses');
+			const result = response.methodResponses?.[0]?.[1];
+			const notDestroyed = result?.notDestroyed as Record<string, { description?: string }> | undefined;
+			if (notDestroyed && Object.keys(notDestroyed).length) {
+				throw new Error(
+					Object.values(notDestroyed)[0]?.description ?? 'Could not refresh send-from addresses'
+				);
+			}
+		}
+
+		// The next get regenerates one identity per current address (primary + aliases)
+		// on the Stalwart versions that still do; put back whatever it did not.
+		let after = await this.readIdentities();
+		const kept = new Set(after.map((identity) => identity.email?.trim().toLowerCase()));
+		const lost = before.filter((identity) => identity.email && !kept.has(identity.email.trim().toLowerCase()));
+		if (lost.length) after = await this.createIdentities(lost.map(({ id: _id, ...identity }) => identity));
+
+		// Regeneration resets names (and drops signatures stored on the identity) —
+		// put back what the user had on addresses that still exist.
+		type IdentityExtras = JMAPIdentity & { textSignature?: string; htmlSignature?: string };
+		const previousByEmail = new Map(
+			(before as IdentityExtras[])
+				.filter((identity) => identity.email)
+				.map((identity) => [identity.email.trim().toLowerCase(), identity])
+		);
+		for (const identity of after) {
+			const previous = previousByEmail.get(identity.email?.trim().toLowerCase() ?? '');
+			if (!previous) continue;
+			const update: Record<string, string> = {};
+			if (previous.name?.trim() && previous.name.trim() !== identity.name?.trim()) {
+				update.name = previous.name.trim();
+			}
+			if (previous.textSignature) update.textSignature = previous.textSignature;
+			if (previous.htmlSignature) update.htmlSignature = previous.htmlSignature;
+			if (!Object.keys(update).length) continue;
+			try {
+				const response = await this.request(
+					[['Identity/set', { accountId: this.accountId, update: { [identity.id]: update } }, 'ir']],
+					['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+				);
+				this.throwOnSetErrors(response, 'Could not restore identity details');
+				if (update.name) identity.name = update.name;
+			} catch {
+				// Keep the regenerated values if the restore fails.
+			}
+		}
+
+		return after;
+	}
+
+	/** Update the display name on one of the account's send-as identities. */
+	async setIdentityName(identityId: string, name: string): Promise<void> {
+		await this.updateIdentity(identityId, { name });
+	}
+
+	/** Patch a send-as identity; only the provided fields change. */
+	async updateIdentity(
+		identityId: string,
+		patch: Partial<Pick<JMAPIdentity, 'name' | 'textSignature' | 'htmlSignature'>>
+	): Promise<void> {
+		const response = await this.request(
+			[['Identity/set', { accountId: this.accountId, update: { [identityId]: patch } }, 'is']],
+			['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+		);
+		this.throwOnSetErrors(response, 'Could not update the address');
+	}
+
+	async queryEmails(
+		mailboxId: string,
+		limit = 50,
+		position = 0,
+		options?: { unseenOnly?: boolean; flaggedOnly?: boolean; keyword?: string }
+	): Promise<EmailQueryResult> {
+		// One FilterCondition can carry several properties (RFC 8620 §5.5); they AND.
+		const filter: Record<string, unknown> = { inMailbox: mailboxId };
+		if (options?.unseenOnly) filter.notKeyword = '$seen';
+		if (options?.flaggedOnly) filter.hasKeyword = '$flagged';
+		// One hasKeyword per condition; the list offers Flagged or a category, never both.
+		if (options?.keyword) filter.hasKeyword = options.keyword;
+		const response = await this.request([
+			[
+				'Email/query',
+				{
+					accountId: this.accountId,
+					filter,
+					sort: [{ property: 'receivedAt', isAscending: false }],
+					limit,
+					position,
+					calculateTotal: false
+				},
+				'q0'
+			],
+			[
+				'Email/get',
+				{
+					accountId: this.accountId,
+					'#ids': { resultOf: 'q0', name: 'Email/query', path: '/ids' },
+					properties: [...EMAIL_LIST_PROPERTIES]
+				},
+				'g0'
+			]
+		]);
+
+		const queryResult = response.methodResponses?.[0]?.[1];
+		const getResult = response.methodResponses?.[1]?.[1];
+
+		if (response.methodResponses?.[1]?.[0] !== 'Email/get' || !getResult) {
+			return { emails: [], total: null, hasMore: false };
+		}
+
+		const emails = (getResult.list as JMAPEmail[]) ?? [];
+		const ids = (queryResult?.ids as string[] | undefined) ?? [];
+		const idCount = ids.length || emails.length;
+		const total =
+			typeof queryResult?.total === 'number' ? (queryResult.total as number) : null;
+		const hasMore = emailQueryHasMore({
+			position,
+			idCount,
+			limit,
+			total: total ?? undefined
+		});
+
+		return { emails, total, hasMore };
+	}
+
+	async searchEmails(
+		query: string,
+		limit = 50,
+		position = 0,
+		mailboxId?: string
+	): Promise<EmailQueryResult> {
+		const { filter } = parseSearchQuery(query);
+		const scopedFilter = mailboxId ? allOf([{ inMailbox: mailboxId }, filter]) : filter;
+
+		const response = await this.request([
+			[
+				'Email/query',
+				{
+					accountId: this.accountId,
+					filter: scopedFilter,
+					sort: [{ property: 'receivedAt', isAscending: false }],
+					limit,
+					position
+				},
+				's0'
+			],
+			[
+				'Email/get',
+				{
+					accountId: this.accountId,
+					'#ids': { resultOf: 's0', name: 'Email/query', path: '/ids' },
+					properties: [...EMAIL_LIST_PROPERTIES]
+				},
+				'g0'
+			]
+		]);
+
+		const queryCall = response.methodResponses?.[0];
+		const queryResult = queryCall?.[1];
+		const getResult = response.methodResponses?.[1]?.[1];
+
+		// A rejected filter used to read as "no results". It is an error, and the
+		// list should say so rather than show an empty folder.
+		if (queryCall?.[0] === 'error') {
+			const error = queryResult as { type?: string; description?: string } | undefined;
+			throw new JmapMethodError(
+				error?.type ?? 'error',
+				error?.description ?? error?.type ?? 'Email/query failed'
+			);
+		}
+		if (response.methodResponses?.[1]?.[0] !== 'Email/get' || !getResult) {
+			return { emails: [], total: 0, hasMore: false };
+		}
+
+		const emails = (getResult.list as JMAPEmail[]) ?? [];
+		const total = (queryResult?.total as number) ?? emails.length;
+		const hasMore = position + emails.length < total;
+
+		return { emails, total, hasMore };
+	}
+
+	async getEmail(emailId: string): Promise<JMAPEmail | null> {
+		const response = await this.request([
+			[
+				'Email/get',
+				{
+					accountId: this.accountId,
+					ids: [emailId],
+					properties: [...EMAIL_DETAIL_PROPERTIES],
+					fetchTextBodyValues: true,
+					fetchHTMLBodyValues: true,
+					maxBodyValueBytes: 256000
+				},
+				'e0'
+			]
+		]);
+
+		const first = response.methodResponses?.[0];
+		if (first?.[0] !== 'Email/get') return null;
+		const list = (first[1].list as JMAPEmail[]) ?? [];
+		return list[0] ?? null;
+	}
+
+	async getThreadEmails(threadId: string): Promise<JMAPEmail[]> {
+		const response = await this.request([
+			[
+				'Email/query',
+				{
+					accountId: this.accountId,
+					filter: { inThread: threadId },
+					sort: [{ property: 'receivedAt', isAscending: true }],
+					limit: 100
+				},
+				'tq0'
+			],
+			[
+				'Email/get',
+				{
+					accountId: this.accountId,
+					'#ids': { resultOf: 'tq0', name: 'Email/query', path: '/ids' },
+					properties: [...EMAIL_DETAIL_PROPERTIES],
+					fetchTextBodyValues: true,
+					fetchHTMLBodyValues: true,
+					maxBodyValueBytes: 256000
+				},
+				'tg0'
+			]
+		]);
+
+		const getResult = response.methodResponses?.[1]?.[1];
+		if (response.methodResponses?.[1]?.[0] !== 'Email/get' || !getResult) {
+			return [];
+		}
+
+		return (getResult.list as JMAPEmail[]) ?? [];
+	}
+
+	async markAsRead(emailId: string, read = true): Promise<void> {
+		await this.markManyAsRead([emailId], read);
+	}
+
+	async markManyAsRead(emailIds: string[], read = true): Promise<void> {
+		if (!emailIds.length) return;
+
+		const update: Record<string, Record<string, unknown>> = {};
+		for (const emailId of emailIds) {
+			update[emailId] = { 'keywords/$seen': read ? true : null };
+		}
+
+		const response = await this.request([
+			['Email/set', { accountId: this.accountId, update }, '0']
+		]);
+		assertEmailSetSucceeded(response, 'Could not update read status');
+	}
+
+	/**
+	 * One `Email/set` for the whole selection, like `markManyAsRead` and
+	 * `toggleImportant`. It used to take a single id, so starring a selection
+	 * meant one JMAP request per message through `Promise.all`, and the server
+	 * answered `maxConcurrentRequests` — from the fourth request, in the
+	 * failures this replaces. Promise.all then rejected, so the owner got an
+	 * error over a selection that had been starred in part.
+	 */
+	async toggleStar(emailIds: string[], starred: boolean): Promise<void> {
+		if (!emailIds.length) return;
+
+		const update: Record<string, Record<string, unknown>> = {};
+		for (const emailId of emailIds) {
+			// `null`, not `false`: a keyword patch is set-or-remove (RFC 8621).
+			update[emailId] = { 'keywords/$flagged': starred ? true : null };
+		}
+
+		const response = await this.request([
+			['Email/set', { accountId: this.accountId, update }, '0']
+		]);
+		assertEmailSetSucceeded(response, 'Could not update star');
+	}
+
+	/**
+	 * Set or clear keywords across messages in one `Email/set`: `{ id: { 'cat.x': true, 'cat.y': null } }`.
+	 * A keyword patch is set-or-remove (RFC 8621), hence `null` and never `false`.
+	 */
+	async patchKeywords(patches: Record<string, Record<string, true | null>>): Promise<void> {
+		const update: Record<string, Record<string, unknown>> = {};
+		for (const [emailId, keywords] of Object.entries(patches)) {
+			const patch: Record<string, unknown> = {};
+			for (const [keyword, on] of Object.entries(keywords)) patch[`keywords/${keyword}`] = on;
+			update[emailId] = patch;
+		}
+		if (Object.keys(update).length === 0) return;
+		const response = await this.request([
+			['Email/set', { accountId: this.accountId, update }, '0']
+		]);
+		assertEmailSetSucceeded(response, 'Could not update keywords');
+	}
+
+	async toggleImportant(
+		emailIds: string[],
+		important: boolean,
+		importantMailboxId?: string
+	): Promise<void> {
+		if (!emailIds.length) return;
+
+		const update: Record<string, Record<string, unknown>> = {};
+		for (const emailId of emailIds) {
+			const patch: Record<string, unknown> = {
+				'keywords/$important': important ? true : null
+			};
+			if (importantMailboxId) {
+				patch[`mailboxIds/${importantMailboxId}`] = important ? true : null;
+			}
+			update[emailId] = patch;
+		}
+
+		const response = await this.request([
+			['Email/set', { accountId: this.accountId, update }, '0']
+		]);
+		assertEmailSetSucceeded(response, 'Could not update highlight');
+	}
+
+	async moveToMailbox(emailId: string, mailboxId: string, sourceMailboxId?: string): Promise<void> {
+		await this.moveEmailsToMailbox([emailId], mailboxId, sourceMailboxId);
+	}
+
+	async moveEmailsToMailbox(emailIds: string[], mailboxId: string, sourceMailboxId?: string): Promise<void> {
+		if (!emailIds.length) return;
+
+		const update: Record<string, Record<string, unknown>> = {};
+		for (const emailId of emailIds) {
+			update[emailId] = sourceMailboxId
+				? {
+						[`mailboxIds/${sourceMailboxId}`]: null,
+						[`mailboxIds/${mailboxId}`]: true
+					}
+				: { mailboxIds: { [mailboxId]: true } };
+		}
+
+		const response = await this.request([
+			['Email/set', { accountId: this.accountId, update }, '0']
+		]);
+		assertEmailSetSucceeded(response, 'Could not move message');
+	}
+
+	async destroyEmail(emailId: string): Promise<void> {
+		await this.destroyEmails([emailId]);
+	}
+
+	/** Permanently delete every email in a mailbox. Returns the count removed. */
+	async emptyMailbox(mailboxId: string): Promise<number> {
+		const BATCH = 200;
+		let removed = 0;
+		while (true) {
+			const response = await this.request([
+				[
+					'Email/query',
+					{
+						accountId: this.accountId,
+						filter: { inMailbox: mailboxId },
+						limit: BATCH,
+						position: 0
+					},
+					'q0'
+				]
+			]);
+			const queryResult = response.methodResponses?.[0]?.[1] as
+				| { ids?: string[] }
+				| undefined;
+			const ids = queryResult?.ids ?? [];
+			if (!ids.length) return removed;
+			await this.destroyEmails(ids);
+			removed += ids.length;
+			if (ids.length < BATCH) return removed;
+		}
+	}
+
+	async destroyEmails(emailIds: string[]): Promise<void> {
+		if (!emailIds.length) return;
+
+		const response = await this.request([
+			['Email/set', { accountId: this.accountId, destroy: emailIds }, '0']
+		]);
+		assertEmailSetSucceeded(response, 'Could not delete message');
+	}
+
+	async saveDraft(params: {
+		jmapDraftId?: string;
+		to: EmailRecipientInput[];
+		cc?: EmailRecipientInput[];
+		bcc?: EmailRecipientInput[];
+		subject: string;
+		body: string;
+		bodyHtml?: string;
+		fromEmail: string;
+		fromName?: string;
+		attachments?: EmailAttachmentInput[];
+		format?: ComposeFormat;
+		/** What a reply draft answers: kept in its headers, so it still threads when finished later. */
+		answers?: EmailAnswerInput;
+	}): Promise<string> {
+		const mailboxes = await this.getMailboxes();
+		const draftsMailbox = mailboxes.find((mb) => mb.role === 'drafts');
+		if (!draftsMailbox) throw new Error('No drafts folder found');
+
+		const draftKey = params.jmapDraftId ?? `draft-${Date.now()}`;
+		const emailData = buildEmailCreateData({
+			fromEmail: params.fromEmail,
+			fromName: params.fromName,
+			to: params.to,
+			cc: params.cc,
+			bcc: params.bcc,
+			subject: params.subject,
+			bodyText: params.body,
+			bodyHtml: params.bodyHtml,
+			format: params.format,
+			mailboxIds: { [draftsMailbox.id]: true },
+			keywords: { $draft: true, $seen: true },
+			attachments: params.attachments,
+			...answerHeaders(params.answers)
+		});
+
+		if (params.jmapDraftId) {
+			const newDraftKey = `draft-update-${Date.now()}`;
+			const response = await this.request([
+				[
+					'Email/set',
+					{
+						accountId: this.accountId,
+						create: { [newDraftKey]: emailData }
+					},
+					'0'
+				],
+				[
+					'Email/set',
+					{
+						accountId: this.accountId,
+						destroy: [params.jmapDraftId]
+					},
+					'1'
+				]
+			]);
+			const result = assertEmailSetSucceeded(response, 'Could not update draft');
+			const created = result.created as Record<string, { id?: string }> | undefined;
+			const createdId = created?.[newDraftKey]?.id;
+			if (!createdId) throw new Error('Draft update response missing id');
+			return createdId;
+		}
+
+		const response = await this.request([
+			['Email/set', { accountId: this.accountId, create: { [draftKey]: emailData } }, '0']
+		]);
+		const result = assertEmailSetSucceeded(response, 'Could not save draft');
+		const created = result.created as Record<string, { id?: string }> | undefined;
+		const createdId = created?.[draftKey]?.id;
+		if (!createdId) throw new Error('Draft save response missing id');
+		return createdId;
+	}
+
+	openEventStream(): Promise<Response> {
+		// Only types the server has: Apache James answers 400 to one it does not know.
+		const EVENT_SOURCE_TYPES = [
+			'Mailbox,Email',
+			this.hasCalendars() && 'CalendarEvent,Calendar',
+			this.hasContacts() && 'ContactCard,AddressBook'
+		]
+			.filter(Boolean)
+			.join(',');
+		if (this.proxyMode) {
+			return fetch('/api/jmap/events');
+		}
+
+		if (!this.session?.eventSourceUrl) {
+			throw new Error('No event source URL');
+		}
+
+		let url = this.session.eventSourceUrl;
+		if (url.includes('{types}')) {
+			url = url
+				.replace('{types}', encodeURIComponent(EVENT_SOURCE_TYPES))
+				.replace('{closeafter}', encodeURIComponent('no'))
+				.replace('{ping}', encodeURIComponent('30'));
+		} else {
+			const separator = url.includes('?') ? '&' : '?';
+			url = `${url}${separator}types=${EVENT_SOURCE_TYPES}&closeafter=no&ping=30`;
+		}
+		return this.authenticatedFetch(url, { headers: { Accept: 'text/event-stream' } });
+	}
+
+	async sendEmail(
+		to: EmailRecipientInput[],
+		subject: string,
+		body: string,
+		options?: {
+			cc?: EmailRecipientInput[];
+			bcc?: EmailRecipientInput[];
+			identityId?: string;
+			fromEmail?: string;
+			fromName?: string;
+			attachments?: EmailAttachmentInput[];
+			format?: ComposeFormat;
+			bodyHtml?: string;
+			/** UTC ISO time for delayed delivery (SMTP FUTURERELEASE via the JMAP envelope). */
+			sendAt?: string;
+			/** Server email id from a previous attempt; lets retries resume instead of re-creating. */
+			jmapEmailId?: string;
+			/** Called with the server email id once the outgoing email exists, before submission. */
+			onEmailCreated?: (emailId: string) => void | Promise<void>;
+			/** The message this replies to or forwards: threads the reply, and flags that message once sent. */
+			answers?: EmailAnswerInput;
+		}
+	): Promise<void> {
+		const mailboxes = await this.getMailboxes();
+		const sentMailbox = mailboxes.find((mb) => mb.role === 'sent');
+		const draftsMailbox = mailboxes.find((mb) => mb.role === 'drafts');
+		const scheduledMailbox = mailboxes.find((mb) => mb.role === 'scheduled');
+		if (!sentMailbox) throw new Error('No sent mailbox found');
+		if (options?.sendAt && !scheduledMailbox) throw new Error('No scheduled mailbox found');
+
+		let identityId = options?.identityId;
+		if (!identityId) {
+			const identities = await this.getIdentities();
+			const fromEmail = options?.fromEmail ?? this.username;
+			identityId = identities.find((id) => id.email === fromEmail)?.id ?? identities[0]?.id;
+			if (!identityId) throw new Error('This account has no address to send from');
+		}
+
+		const fromEmail = options?.fromEmail ?? this.username;
+		// Immediate sends are created in Sent so a failed mailbox patch cannot
+		// leave the copy with no mailboxes (JMAP destroys those). Scheduled
+		// mail still holds in Scheduled until reconcileScheduledEmails.
+		const holdingMailboxId = options?.sendAt
+			? (scheduledMailbox!.id ?? draftsMailbox?.id ?? sentMailbox.id)
+			: sentMailbox.id;
+		const targetMailboxId = options?.sendAt ? scheduledMailbox!.id : sentMailbox.id;
+
+		// Phase 1: make sure the outgoing email exists on the server exactly once.
+		// On retry, check whether a previous attempt already submitted it — a lost
+		// response after the server accepted the send must not produce a duplicate.
+		let emailId = options?.jmapEmailId;
+		if (emailId) {
+			const status = await this.checkSendStatus(emailId);
+			if (status === 'submitted') return;
+			if (status === 'missing') emailId = undefined;
+		}
+
+		if (!emailId) {
+			const emailData = buildEmailCreateData({
+				fromEmail,
+				fromName: options?.fromName,
+				to,
+				cc: options?.cc,
+				bcc: options?.bcc,
+				subject,
+				bodyText: body,
+				bodyHtml: options?.bodyHtml,
+				format: options?.format,
+				mailboxIds: { [holdingMailboxId]: true },
+				keywords: options?.sendAt ? { $draft: true } : { $seen: true },
+				attachments: options?.attachments,
+				...answerHeaders(options?.answers)
+			});
+			emailId = await this.createOutgoingEmail(emailData);
+			await options?.onEmailCreated?.(emailId);
+		}
+
+		// Phase 2: submit for delivery and keep a copy in Sent (or Scheduled).
+		// Replace mailboxIds as a whole — patching mailboxIds/<id> null then
+		// adding Sent can leave the message in no mailbox if the add is dropped.
+		const submission: Record<string, unknown> = { emailId, identityId };
+		if (options?.sendAt) {
+			const holdSeconds = Math.max(
+				1,
+				Math.round((new Date(options.sendAt).getTime() - Date.now()) / 1000)
+			);
+			const rcptTo = [
+				...new Set([...to, ...(options.cc ?? []), ...(options.bcc ?? [])].map(recipientEmail))
+			];
+			submission.envelope = {
+				mailFrom: { email: fromEmail, parameters: { holdfor: String(holdSeconds) } },
+				rcptTo: rcptTo.map((email) => ({ email }))
+			};
+		}
+
+		const response = await this.request(
+			[
+				[
+					'EmailSubmission/set',
+					{
+						accountId: this.accountId,
+						create: { '1': submission },
+						onSuccessUpdateEmail: {
+							'#1': {
+								mailboxIds: { [targetMailboxId]: true },
+								'keywords/$draft': null,
+								'keywords/$seen': true
+							}
+						}
+					},
+					'0'
+				]
+			],
+			['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+		);
+		// A refused submission leaves the copy made in phase 1 sitting in Sent as
+		// if it went out — remove it. Only when the submission itself was refused:
+		// a failed move after an accepted one must keep the copy.
+		if (!(response.methodResponses?.[0]?.[1]?.created as Record<string, unknown> | undefined)?.['1']) {
+			await this.destroyEmails([emailId]).catch(() => undefined);
+		}
+		this.throwOnSetErrors(response, 'Failed to send email');
+		// The message has gone; a flag that could not be set is not a failed send.
+		if (options?.answers) await this.markAnswered(options.answers).catch(() => undefined);
+	}
+
+	/**
+	 * Flag the message a sent reply answers, or a forward carries. Whatever is
+	 * found is checked against the Message-ID first: an id taken from a shared
+	 * mailbox names nothing in this account, or some other message.
+	 */
+	private async markAnswered(answers: EmailAnswerInput): Promise<void> {
+		if (!answers.messageId) return;
+		const get = { accountId: this.accountId, properties: ['messageId'] };
+		// A reply reopened from Drafts knows its message only by Message-ID: look it up.
+		// ponytail: a server that refuses the header filter leaves the flag unset (the send stands).
+		const response = await this.request(
+			answers.emailId
+				? [['Email/get', { ...get, ids: [answers.emailId] }, 'g']]
+				: [
+						['Email/query', { accountId: this.accountId, filter: { header: ['Message-ID', answers.messageId] }, limit: 10 }, 'q'],
+						['Email/get', { ...get, '#ids': { resultOf: 'q', name: 'Email/query', path: '/ids' } }, 'g']
+					]
+		);
+		const list = (response.methodResponses?.find(([name]) => name === 'Email/get')?.[1]?.list ?? []) as JMAPEmail[];
+		const keyword = answers.forward ? '$forwarded' : '$answered';
+		await this.patchKeywords(
+			Object.fromEntries(
+				list
+					.filter((email) => email.messageId?.includes(answers.messageId))
+					.map((email) => [email.id, { [keyword]: true as const }])
+			)
+		);
+	}
+
+	/**
+	 * Move messages whose delayed submission has been released (undoStatus no
+	 * longer pending) from Scheduled to Sent. Returns true if anything moved.
+	 */
+	async reconcileScheduledEmails(): Promise<boolean> {
+		const mailboxes = await this.getMailboxes();
+		const scheduled = mailboxes.find((mb) => mb.role === 'scheduled');
+		const sent = mailboxes.find((mb) => mb.role === 'sent');
+		if (!scheduled || !sent) return false;
+
+		const queryResponse = await this.request([
+			['Email/query', { accountId: this.accountId, filter: { inMailbox: scheduled.id } }, 'q']
+		]);
+		const queryResult = queryResponse.methodResponses?.[0];
+		if (queryResult?.[0] !== 'Email/query') return false;
+		const emailIds = (queryResult[1].ids as string[]) ?? [];
+		if (!emailIds.length) return false;
+
+		const subResponse = await this.request(
+			[
+				['EmailSubmission/query', { accountId: this.accountId, filter: { emailIds } }, 'sq'],
+				[
+					'EmailSubmission/get',
+					{
+						accountId: this.accountId,
+						'#ids': { resultOf: 'sq', name: 'EmailSubmission/query', path: '/ids' },
+						properties: ['id', 'emailId', 'undoStatus']
+					},
+					'sg'
+				]
+			],
+			['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+		);
+		const subGet = subResponse.methodResponses?.find((r) => r[0] === 'EmailSubmission/get');
+		if (!subGet) return false;
+		const submissions =
+			(subGet[1].list as Array<{ emailId: string; undoStatus: string }> | undefined) ?? [];
+
+		const released = new Set(
+			submissions.filter((sub) => sub.undoStatus === 'final').map((sub) => sub.emailId)
+		);
+		const toMove = emailIds.filter((id) => released.has(id));
+		if (!toMove.length) return false;
+
+		const update: Record<string, Record<string, boolean | null>> = {};
+		for (const id of toMove) {
+			update[id] = {
+				[`mailboxIds/${scheduled.id}`]: null,
+				[`mailboxIds/${sent.id}`]: true
+			};
+		}
+		await this.request([['Email/set', { accountId: this.accountId, update }, '0']]);
+		return true;
+	}
+
+	/**
+	 * Cancel whatever sends are still pending for these messages. Returns how
+	 * many were cancelled — 0 when none was scheduled, or all have gone out.
+	 */
+	async cancelPendingSends(emailIds: string[]): Promise<number> {
+		if (!emailIds.length) return 0;
+		const response = await this.request(
+			[
+				[
+					'EmailSubmission/query',
+					{ accountId: this.accountId, filter: { emailIds, undoStatus: 'pending' } },
+					'q'
+				]
+			],
+			['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+		);
+		const queryResult = response.methodResponses?.[0];
+		const submissionIds =
+			queryResult?.[0] === 'EmailSubmission/query' ? ((queryResult[1].ids as string[]) ?? []) : [];
+		if (!submissionIds.length) return 0;
+
+		const cancelResponse = await this.request(
+			[
+				[
+					'EmailSubmission/set',
+					{
+						accountId: this.accountId,
+						update: Object.fromEntries(submissionIds.map((id) => [id, { undoStatus: 'canceled' }]))
+					},
+					'0'
+				]
+			],
+			['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+		);
+		this.throwOnSetErrors(cancelResponse, 'Could not cancel the scheduled send');
+		return submissionIds.length;
+	}
+
+	/** Cancel a pending delayed send and move the message back to Drafts. */
+	async cancelScheduledSend(emailId: string): Promise<void> {
+		if (!(await this.cancelPendingSends([emailId]))) {
+			throw new Error('This message is no longer scheduled — it may already be sent.');
+		}
+
+		const mailboxes = await this.getMailboxes();
+		const scheduled = mailboxes.find((mb) => mb.role === 'scheduled');
+		const drafts = mailboxes.find((mb) => mb.role === 'drafts');
+		if (!drafts) return;
+		await this.request([
+			[
+				'Email/set',
+				{
+					accountId: this.accountId,
+					update: {
+						[emailId]: {
+							...(scheduled ? { [`mailboxIds/${scheduled.id}`]: null } : {}),
+							[`mailboxIds/${drafts.id}`]: true,
+							'keywords/$draft': true
+						}
+					}
+				},
+				'0'
+			]
+		]);
+	}
+
+	private async createOutgoingEmail(emailData: Record<string, unknown>): Promise<string> {
+		const createId = 'outgoing';
+		const response = await this.request(
+			[
+				[
+					'Email/set',
+					{
+						accountId: this.accountId,
+						create: { [createId]: emailData }
+					},
+					'0'
+				]
+			],
+			['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail']
+		);
+		this.throwOnSetErrors(response, 'Failed to create outgoing email');
+
+		for (const [methodName, result] of response.methodResponses ?? []) {
+			if (methodName === 'Email/set') {
+				const created = (result.created as Record<string, { id?: string }> | undefined)?.[createId];
+				if (created?.id) return created.id;
+			}
+		}
+		throw new Error('Failed to create outgoing email');
+	}
+
+	/**
+	 * Determine whether a previously created outgoing email was already submitted.
+	 * Returns `draft` when in doubt (e.g. the server can't answer) so the caller
+	 * falls back to submitting — the same behavior as before this check existed.
+	 */
+	private async checkSendStatus(emailId: string): Promise<'submitted' | 'draft' | 'missing'> {
+		try {
+			const response = await this.request(
+				[
+					[
+						'EmailSubmission/query',
+						{ accountId: this.accountId, filter: { emailIds: [emailId] } },
+						'0'
+					],
+					['Email/get', { accountId: this.accountId, ids: [emailId], properties: ['id'] }, '1']
+				],
+				['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission']
+			);
+
+			let submitted = false;
+			let emailGetAnswered = false;
+			let emailExists = false;
+
+			for (const [methodName, result] of response.methodResponses ?? []) {
+				if (methodName === 'EmailSubmission/query' && Array.isArray(result.ids)) {
+					submitted = result.ids.length > 0;
+				}
+				if (methodName === 'Email/get' && Array.isArray(result.list)) {
+					emailGetAnswered = true;
+					emailExists = result.list.length > 0;
+				}
+			}
+
+			if (submitted) return 'submitted';
+			if (!emailGetAnswered) return 'draft';
+			return emailExists ? 'draft' : 'missing';
+		} catch {
+			return 'draft';
+		}
+	}
+
+	private throwCalendarSetErrors(response: JMAPResponse, fallbackMessage: string): void {
+		for (const [methodName, result] of response.methodResponses ?? []) {
+			if (methodName === 'error' || methodName.endsWith('/error')) {
+				const failure = result as { type?: string; description?: string };
+				throw new JmapMethodError(
+					failure.type ?? 'error',
+					failure.description ?? failure.type ?? fallbackMessage
+				);
+			}
+			if (methodName !== 'Calendar/set') continue;
+
+			const buckets = [result.notCreated, result.notUpdated, result.notDestroyed];
+			for (const bucket of buckets) {
+				if (bucket && typeof bucket === 'object' && Object.keys(bucket).length) {
+					const firstError = Object.values(bucket)[0] as {
+						description?: string;
+						type?: string;
+					};
+					throw new JmapMethodError(
+						firstError?.type ?? 'error',
+						firstError?.description ?? firstError?.type ?? fallbackMessage
+					);
+				}
+			}
+		}
+	}
+
+	private throwOnSetErrors(response: JMAPResponse, fallbackMessage: string): void {
+		for (const [methodName, result] of response.methodResponses ?? []) {
+			if (methodName.endsWith('/error')) {
+				throw new Error((result.description as string) || `${fallbackMessage}: ${methodName}`);
+			}
+			const failures = firstSetFailure(result.notCreated) ?? firstSetFailure(result.notUpdated);
+			if (failures) {
+				throw new Error(failures.description || failures.type || fallbackMessage);
+			}
+		}
+	}
+}

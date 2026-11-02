@@ -1,0 +1,12 @@
+{
+  "name": "@zaur/ui",
+  "version": "0.2.0",
+  "private": true,
+  "description": "The Zaur suite's design system: tokens, primitives and the UI mono, shared by Mail, Register and Music.",
+  "type": "module",
+  "exports": {
+    "./tokens.css": "./src/tokens.css",
+    "./base.css": "./src/base.css",
+    "./fonts/*": "./src/fonts/*"
+  }
+}

@@ -1,0 +1,244 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+	DRAFT_CONTENT_KEYS,
+	buildDraftSaveInput,
+	draftContentSignature,
+	hasDraftContent,
+	localDraft
+} from '../src/lib/compose/draft-save.ts';
+import { outgoingHtml } from '../src/lib/compose/html.ts';
+import { draftSeed } from '../src/lib/compose/quote.ts';
+import { attachmentFromServer } from '../src/lib/compose/attachments.ts';
+import type { Draft, Recipient } from '../src/lib/compose/types.ts';
+import type { MessageDetail } from '@zaur/mail-core';
+
+function chip(email: string, name = ''): Recipient {
+	return { name, email, meta: '' };
+}
+
+function draft(overrides: Partial<Draft> = {}): Draft {
+	return {
+		id: 'd1',
+		kind: 'new',
+		from: '',
+		signature: '',
+		to: [],
+		toInput: '',
+		toOpen: false,
+		toHi: 0,
+		cc: [],
+		ccInput: '',
+		ccOpen: false,
+		ccHi: 0,
+		bcc: [],
+		bccInput: '',
+		bccOpen: false,
+		bccHi: 0,
+		ccShown: false,
+		bccShown: false,
+		subject: '',
+		body: '',
+		bodyHtml: '',
+		plain: false,
+		attachments: [],
+		sendAt: null,
+		bodyOpened: false,
+		stage: 'default',
+		x: 24,
+		y: 76,
+		w: 560,
+		h: 460,
+		saved: null,
+		auto: true,
+		gesture: false,
+		z: 70,
+		focusTarget: 'to',
+		sending: false,
+		sendError: null,
+		jmapDraftId: null,
+		draftSaving: false,
+		draftSavedAt: null,
+		...overrides
+	};
+}
+
+function detail(overrides: Partial<MessageDetail> = {}): MessageDetail {
+	return {
+		id: 'm1',
+		threadId: 't1',
+		mailboxId: 'drafts',
+		subject: 'Hello',
+		from: { name: 'Me', email: 'me@zaur.app' },
+		to: [{ name: 'Ada', email: 'ada@example.com' }],
+		cc: [{ name: '', email: 'cara@z.com' }, { name: '', email: 'bob@y.com' }],
+		bcc: [{ name: '', email: 'hidden@z.com' }],
+		bodyText: 'Half-written body',
+		attachments: [],
+		receivedAt: '2026-09-10T09:30:00.000Z',
+		preview: '',
+		hasAttachment: false,
+		...overrides
+	} as unknown as MessageDetail;
+}
+
+// --- autosave bookkeeping ---
+
+test('DRAFT_CONTENT_KEYS: content only — no toInput, no geometry', () => {
+	assert.deepEqual([...DRAFT_CONTENT_KEYS].sort(), [
+		'attachments',
+		'bcc',
+		'body',
+		'bodyHtml',
+		'cc',
+		'from',
+		'subject',
+		'to'
+	]);
+	assert.equal(DRAFT_CONTENT_KEYS.has('toInput'), false);
+	assert.equal(DRAFT_CONTENT_KEYS.has('x'), false);
+	assert.equal(DRAFT_CONTENT_KEYS.has('h'), false);
+});
+
+test('buildDraftSaveInput: dedupes every field, keeps the names, passes content through', () => {
+	const input = buildDraftSaveInput(
+		draft({
+			to: [chip('Ada@X.com'), chip('ada@x.com'), chip('', ''), chip('bob@y.com')],
+			cc: [chip('cara@z.com', 'Cara'), chip('cara@z.com')],
+			bcc: [chip('hidden@z.com')],
+			subject: 'Hi',
+			body: 'Body',
+			jmapDraftId: 'm-draft-1',
+			attachments: [
+				attachmentFromServer({ blobId: 'blob-1', name: 'report.pdf', type: 'application/pdf', size: 1024 })
+			]
+		})
+	);
+	assert.deepEqual(input.to, [{ email: 'Ada@X.com' }, { email: 'bob@y.com' }]);
+	assert.deepEqual(input.cc, [{ name: 'Cara', email: 'cara@z.com' }]);
+	assert.deepEqual(input.bcc, [{ email: 'hidden@z.com' }]);
+	assert.equal(input.subject, 'Hi');
+	assert.equal(input.body, 'Body');
+	assert.equal(input.jmapDraftId, 'm-draft-1');
+	assert.deepEqual(input.attachments, [
+		{ blobId: 'blob-1', name: 'report.pdf', type: 'application/pdf', size: 1024 }
+	]);
+});
+
+test('draftContentSignature: same content, different jmapDraftId → same signature', () => {
+	const saved = draft({ subject: 'Hi', body: 'Body', jmapDraftId: 'm-draft-1' });
+	const resaved = draft({ subject: 'Hi', body: 'Body', jmapDraftId: 'm-draft-2' });
+	assert.equal(draftContentSignature(saved), draftContentSignature(resaved));
+	assert.notEqual(
+		draftContentSignature(saved),
+		draftContentSignature(draft({ subject: 'Hi', body: 'Body v2' }))
+	);
+	// Transient typing state never changes the signature.
+	assert.equal(
+		draftContentSignature(draft({ to: [chip('a@x.com')] })),
+		draftContentSignature(draft({ to: [chip('a@x.com')], toInput: 'a' }))
+	);
+});
+
+test('hasDraftContent: empty draft is empty, whitespace does not count', () => {
+	assert.equal(hasDraftContent(draft()), false);
+	assert.equal(hasDraftContent(draft({ subject: '  ', body: '\n\t' })), false);
+	assert.equal(hasDraftContent(draft({ to: [chip('a@x.com')] })), true);
+	assert.equal(hasDraftContent(draft({ cc: [chip('a@x.com')] })), true);
+	assert.equal(hasDraftContent(draft({ bcc: [chip('a@x.com')] })), true);
+	assert.equal(hasDraftContent(draft({ subject: 'Hi' })), true);
+	assert.equal(hasDraftContent(draft({ body: 'x' })), true);
+	assert.equal(
+		hasDraftContent(
+			draft({ attachments: [attachmentFromServer({ blobId: 'b', name: 'f', type: 't', size: 1 })] })
+		),
+		true
+	);
+});
+
+test('hasDraftContent: a signature alone is not a draft', () => {
+	const signature = '\n\n-- \nAda';
+	assert.equal(hasDraftContent(draft({ body: signature, signature })), false);
+	assert.equal(hasDraftContent(draft({ body: `Hi${signature}`, signature })), true);
+	// Changing From is a change worth saving.
+	assert.notEqual(draftContentSignature(draft({ from: 'a@x.com' })), draftContentSignature(draft()));
+});
+
+// --- reopening a server draft ---
+
+test('draftSeed: recipients, body and file attachments — inline images stay out', () => {
+	const filePart = {
+		blobId: 'blob-1',
+		name: 'report.pdf',
+		type: 'application/pdf',
+		size: 1024,
+		disposition: 'attachment'
+	};
+	const inlinePart = {
+		blobId: 'blob-2',
+		name: 'inline.png',
+		type: 'image/png',
+		size: 2048,
+		cid: 'blob-2',
+		disposition: 'inline'
+	};
+	const seed = draftSeed(detail({ id: 'm-draft-7', attachments: [filePart, inlinePart] }));
+	assert.equal(seed.jmapDraftId, 'm-draft-7');
+	assert.deepEqual(seed.to, [{ name: 'Ada', email: 'ada@example.com', meta: '' }]);
+	// Chips, not a joined string — the reopened draft gets a Cc row like the To one.
+	assert.deepEqual(seed.cc, [
+		{ name: '', email: 'cara@z.com', meta: '' },
+		{ name: '', email: 'bob@y.com', meta: '' }
+	]);
+	assert.deepEqual(seed.bcc, [{ name: '', email: 'hidden@z.com', meta: '' }]);
+	assert.equal(seed.subject, 'Hello');
+	assert.equal(seed.body, 'Half-written body');
+	assert.deepEqual(
+		seed.attachments.map((attachment) => [attachment.blobId, attachment.status]),
+		[['blob-1', 'ready']]
+	);
+	assert.equal(attachmentFromServer(filePart).name, 'report.pdf');
+});
+
+test('autosave follows formatting too: the same words in bold are a different draft', () => {
+	assert.notEqual(
+		draftContentSignature(draft({ body: 'Hi', bodyHtml: '<div>Hi</div>' })),
+		draftContentSignature(draft({ body: 'Hi', bodyHtml: '<div><strong>Hi</strong></div>' }))
+	);
+});
+
+test('outgoingHtml: quotes, headings and code carry their own look, since mail has no stylesheet', () => {
+	const html = outgoingHtml('<div>Hi</div><blockquote>Earlier</blockquote>');
+	assert.match(html, /<blockquote style="[^"]*border-left[^"]*">Earlier/);
+	assert.match(outgoingHtml('<h1>Title</h1>'), /^<h1 style="[^"]*font-size:1\.25em[^"]*">Title<\/h1>$/);
+	assert.match(outgoingHtml('<pre>let x</pre>'), /^<pre style="[^"]*monospace[^"]*">let x<\/pre>$/);
+	assert.equal(outgoingHtml('<div>Hi</div>'), '<div>Hi</div>');
+});
+
+test('localDraft: a plain copy of the content; an upload in flight comes back failed', () => {
+	const live = draft({
+		subject: 'Offline',
+		to: [chip('a@x.com')],
+		toInput: 'half-typ',
+		attachments: [
+			{ id: 'c1', name: 'a.pdf', type: 'application/pdf', size: 1, blobId: null, status: 'uploading' },
+			attachmentFromServer({ blobId: 'b2', name: 'b.pdf', type: 'application/pdf', size: 2 })
+		]
+	});
+	const record = localDraft(live, 'acct', true);
+	assert.equal(record.id, 'd1');
+	assert.equal(record.account, 'acct');
+	assert.equal(record.closed, true);
+	assert.equal(record.draft.subject, 'Offline');
+	assert.deepEqual(
+		record.draft.attachments.map((chip) => chip.status),
+		['error', 'ready']
+	);
+	// The live draft is untouched, and panel state stays behind.
+	assert.equal(live.attachments[0]!.status, 'uploading');
+	assert.equal('toInput' in record.draft, false);
+	assert.equal('x' in record.draft, false);
+	// It saves exactly as the panel would have.
+	assert.deepEqual(buildDraftSaveInput(record.draft), buildDraftSaveInput(live));
+});

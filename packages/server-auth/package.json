@@ -1,0 +1,26 @@
+{
+	"name": "@zaur/server-auth",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Server-side session store, sealing, and Stalwart OAuth plumbing shared by webmail and Mail 2.0 (extracted per ADR-0005)",
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts",
+		"./*": "./src/*.ts"
+	},
+	"scripts": {
+		"check": "tsc --noEmit",
+		"test": "node --test --experimental-strip-types tests/*.test.ts"
+	},
+	"dependencies": {
+		"@zaur/mail-core": "workspace:*"
+	},
+	"peerDependencies": {
+		"@sveltejs/kit": "^2.57.0 || ^3.0.0"
+	},
+	"devDependencies": {
+		"@sveltejs/kit": "^3.0.1",
+		"typescript": "^6.0.2",
+		"@types/node": "^25.9.1"
+	}
+}

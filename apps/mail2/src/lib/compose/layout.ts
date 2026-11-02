@@ -1,0 +1,158 @@
+import type { Draft } from './types';
+
+export const PANEL_DEFAULT_W = 760;
+export const PANEL_MIN_W = 420;
+export const PANEL_MAX_W = 960;
+export const PANEL_MIN_H = 240;
+export const PANEL_MAX_H = 1000;
+export const EDGE = 8;
+/** Height a draft settles at once it has a recipient and a subject. */
+export const PANEL_TYPICAL_H = 530;
+const CASCADE = 26;
+const GAP = 14;
+/** Shell chrome a maximized panel must not sit under: top bar and status line. */
+const TOP_CHROME = 52;
+const BOTTOM_CHROME = 36;
+/** The highest a floating panel sits: clear of the top bar, which it used to be parked over. */
+export const PANEL_TOP = TOP_CHROME + EDGE;
+const MARGIN = 12;
+/** How far an opening panel leans from the shell centre toward its button. */
+const CENTRE_PULL = 0.34;
+
+export interface AnchorRect {
+	left: number;
+	top: number;
+	right: number;
+	bottom: number;
+}
+
+/** 0 = no recipient yet, 1 = no subject, 2 = ready to write. */
+export function computeStep(draft: Pick<Draft, 'to' | 'subject'>): 0 | 1 | 2 {
+	if (draft.to.length === 0) return 0;
+	if (draft.subject.trim().length === 0) return 1;
+	return 2;
+}
+
+/** The message box: as tall from the first keystroke as it will be, so a new message opens at a reply's size. */
+export const BODY_H = 340;
+
+/**
+ * Panel height while `auto` is on, computed by hand so it can animate
+ * (a CSS transition to `height: auto` never runs). The attachment strip wraps
+ * by chip width, so the panel passes its measured height (one row is 54).
+ */
+export function computeAutoHeight(draft: Draft, stripH = 54): number {
+	// Chips wrap about two to a line, and every address row grows the same way.
+	const chipRows = (list: { length: number }) => Math.ceil(list.length / 2) * 32;
+	return (
+		45 + // header
+		(44 + chipRows(draft.to)) + // To row: 28 content + 8/8 padding
+		45 + // subject row
+		BODY_H +
+		(draft.ccShown ? 44 + chipRows(draft.cc) : 0) +
+		(draft.bccShown ? 44 + chipRows(draft.bcc) : 0) +
+		(draft.attachments.length > 0 ? stripH : 0) +
+		(draft.sendError ? 34 : 0) +
+		53 // action bar
+	);
+}
+
+/**
+ * Maximize fills the shell's content pane — everything between the top bar and
+ * the status line — rather than floating a slightly bigger box in the middle.
+ * Pixel-computed so the transition can animate (percent math freezes it).
+ */
+export function maximizedRect(rootW: number, rootH: number) {
+	const w = Math.min(PANEL_MAX_W, Math.max(360, rootW - MARGIN * 2));
+	// On a shell too short for the chrome inset, ignore it and use the margin.
+	const y = rootH > 420 ? TOP_CHROME + MARGIN : MARGIN;
+	const h = Math.min(PANEL_MAX_H, Math.max(260, rootH - y - BOTTOM_CHROME - MARGIN));
+	return {
+		x: Math.max(MARGIN, Math.round((rootW - w) / 2)),
+		y,
+		w,
+		h
+	};
+}
+
+/**
+ * Opening position: the panel belongs near the middle of the shell — that is
+ * where it is comfortable to write — but it should still read as coming from
+ * the button that opened it. So take the strictly button-anchored spot, take
+ * the centred spot, and sit a third of the way from centre toward the button.
+ */
+export function openingPosition(
+	button: AnchorRect,
+	rootW: number,
+	rootH: number,
+	openCount: number,
+	width = PANEL_DEFAULT_W,
+	height = PANEL_TYPICAL_H
+) {
+	// Anchored spot: squarely under the button, centred on it. Sitting *beside*
+	// the button reads backwards once it has to flip — a top-right button would
+	// throw the panel left.
+	const anchoredX = (button.left + button.right) / 2 - width / 2;
+	const anchoredY = button.bottom + GAP;
+
+	const centreX = (rootW - width) / 2;
+	const centreY = (rootH - height) / 2;
+	// Cascade is symmetric about the centre, so a stack of panels spreads
+	// through the middle instead of marching off into a corner.
+	const offset = (openCount % 5) * CASCADE - CASCADE * 2;
+
+	const x = centreX + (anchoredX - centreX) * CENTRE_PULL + offset;
+	const y = centreY + (anchoredY - centreY) * CENTRE_PULL + offset;
+	// Never over the top bar: on a short shell the cascade used to lift the first panel onto it.
+	const top = TOP_CHROME + MARGIN;
+	return {
+		x: Math.round(clamp(x, EDGE, Math.max(EDGE, rootW - width - EDGE))),
+		y: Math.round(clamp(y, top, Math.max(top, rootH - height - EDGE)))
+	};
+}
+
+export function clamp(
+	value: number,
+	min: number,
+	max: number
+): number {
+	return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Where a panel is drawn in the shell as it is now. The stored rect is what the
+ * user chose in a window that may since have shrunk: slide it back inside, and
+ * shrink it only when the shell is smaller than the panel.
+ */
+export function fitPanel(
+	rect: { x: number; y: number; w: number; h: number },
+	rootW: number,
+	rootH: number
+) {
+	const w = Math.min(rect.w, Math.max(PANEL_MIN_W, rootW - EDGE * 2));
+	const h = Math.min(rect.h, Math.max(PANEL_MIN_H, rootH - PANEL_TOP - EDGE));
+	return {
+		x: clamp(rect.x, EDGE, Math.max(EDGE, rootW - w - EDGE)),
+		y: clamp(rect.y, PANEL_TOP, Math.max(PANEL_TOP, rootH - h - EDGE)),
+		w,
+		h
+	};
+}
+
+/** Clamp a panel rect against the shell container during drag/resize. */
+export function clampPanel(
+	rect: { x: number; y: number; w: number; h: number },
+	rootW: number,
+	rootH: number
+) {
+	const maxW = Math.min(PANEL_MAX_W, rootW - rect.x - EDGE);
+	const maxH = Math.min(PANEL_MAX_H, rootH - rect.y - EDGE);
+	const w = clamp(rect.w, PANEL_MIN_W, Math.max(PANEL_MIN_W, maxW));
+	const h = clamp(rect.h, PANEL_MIN_H, Math.max(PANEL_MIN_H, maxH));
+	return {
+		x: clamp(rect.x, EDGE, Math.max(EDGE, rootW - w - EDGE)),
+		y: clamp(rect.y, 12, Math.max(12, rootH - h - EDGE)),
+		w,
+		h
+	};
+}

@@ -1,0 +1,31 @@
+import { init, captureException, DEFAULT_IGNORE_PATTERNS } from '@tracewayapp/frontend';
+import { PUBLIC_TRACEWAY_DSN } from '$app/env/public';
+import type { HandleClientError } from '@sveltejs/kit/hooks';
+import { codeNotLoaded } from '#lib/errors';
+
+/*
+ * Error tracking via self-hosted Traceway (traceway.zaur.app), as in webmail 1.0.
+ * DSN is {token}@{url}/api/report; unset = disabled. mail2 sends no CSP today —
+ * if it gets one, connect-src needs https://traceway.zaur.app.
+ *
+ * No session replay and no console mirroring, deliberately: either could ship
+ * someone's mail to the error tracker.
+ */
+if (PUBLIC_TRACEWAY_DSN) {
+	init(PUBLIC_TRACEWAY_DSN, {
+		sessionRecording: false,
+		captureLogs: false,
+		// "Script error." is a cross-origin or extension error with every detail
+		// stripped; the ResizeObserver one is the spec's benign loop notice.
+		ignoreErrors: [...DEFAULT_IGNORE_PATTERNS, /^Script error\./, /^ResizeObserver loop/]
+	});
+}
+
+export const handleError: HandleClientError = ({ kind, error }) => {
+	if (kind !== 'unknown') return;
+	// Not a fault of the app's: the connection or the server is away. The error
+	// card says so and tries again by itself (routes/+error.svelte).
+	if (codeNotLoaded(error)) return { message: 'Internal Error', unreachable: true };
+	console.error(error);
+	captureException(error instanceof Error ? error : new Error(String(error)));
+};

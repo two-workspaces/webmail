@@ -1,0 +1,166 @@
+export interface JMAPIdentity {
+	id: string;
+	name?: string;
+	email: string;
+	replyTo?: { name?: string; email: string }[];
+	textSignature?: string;
+	htmlSignature?: string;
+}
+
+/** Quota object — JMAP Quota extension, RFC 9425. */
+export interface JMAPQuota {
+	id: string;
+	/** "octets" for storage, "count" for object counts. */
+	resourceType: string;
+	used: number;
+	hardLimit?: number | null;
+	softLimit?: number | null;
+	warnLimit?: number | null;
+	scope?: string;
+	name?: string;
+	types?: string[];
+}
+
+/** VacationResponse singleton — RFC 8621 §8. */
+export interface JMAPVacationResponse {
+	id: string;
+	isEnabled: boolean;
+	/** UTCDate, e.g. "2026-07-14T00:00:00Z", or null for "starts immediately". */
+	fromDate?: string | null;
+	/** UTCDate, or null for "until switched off". */
+	toDate?: string | null;
+	subject?: string | null;
+	textBody?: string | null;
+	htmlBody?: string | null;
+}
+
+export interface JMAPMailbox {
+	id: string;
+	name: string;
+	parentId?: string | null;
+	role?: string | null;
+	totalEmails?: number;
+	unreadEmails?: number;
+	sortOrder?: number;
+}
+
+/** RFC 8621 §2 MailboxRights, plus RFC 9670's `mayShare`. */
+export interface JMAPMailboxRights {
+	mayReadItems: boolean;
+	mayAddItems: boolean;
+	mayRemoveItems: boolean;
+	maySetSeen: boolean;
+	maySetKeywords: boolean;
+	mayCreateChild: boolean;
+	mayRename: boolean;
+	mayDelete: boolean;
+	maySubmit: boolean;
+	mayShare?: boolean;
+}
+
+export interface JMAPEmailAddress {
+	name?: string;
+	email: string;
+}
+
+export interface JMAPEmailBodyPart {
+	partId?: string;
+	type?: string;
+}
+
+export interface JMAPEmail {
+	id: string;
+	threadId: string;
+	mailboxIds?: Record<string, boolean>;
+	keywords?: Record<string, boolean>;
+	size?: number;
+	receivedAt: string;
+	from?: JMAPEmailAddress[];
+	to?: JMAPEmailAddress[];
+	cc?: JMAPEmailAddress[];
+	bcc?: JMAPEmailAddress[];
+	replyTo?: JMAPEmailAddress[] | null;
+	/** Message-IDs, without their angle brackets (RFC 8621 §4.1.2.3). */
+	messageId?: string[] | null;
+	inReplyTo?: string[] | null;
+	references?: string[] | null;
+	subject?: string;
+	preview?: string;
+	textBody?: JMAPEmailBodyPart[];
+	htmlBody?: JMAPEmailBodyPart[];
+	bodyValues?: Record<string, { value: string; isEncodingProblem?: boolean; isTruncated?: boolean }>;
+	hasAttachment?: boolean;
+	bodyStructure?: JMAPBodyPart;
+}
+
+export interface JMAPBodyPart {
+	partId?: string;
+	blobId?: string;
+	name?: string;
+	type?: string;
+	size?: number;
+	disposition?: string;
+	cid?: string;
+	subParts?: JMAPBodyPart[];
+}
+
+export interface JMAPSession {
+	apiUrl: string;
+	downloadUrl: string;
+	uploadUrl?: string;
+	eventSourceUrl?: string;
+	username?: string;
+	primaryAccounts?: Record<string, string>;
+	accounts?: Record<
+		string,
+		{
+			name?: string;
+			isPersonal?: boolean;
+			isReadOnly?: boolean;
+			accountCapabilities?: Record<string, unknown>;
+		}
+	>;
+	capabilities?: Record<string, unknown>;
+}
+
+export type JMAPMethodCall = [string, Record<string, unknown>, string];
+
+export interface JMAPResponse {
+	methodResponses: Array<[string, Record<string, unknown>, string]>;
+}
+
+/** RFC 9661 §2.1. The body is a blob; only its id lives on the object. */
+export interface JMAPSieveScript {
+	id: string;
+	name: string | null;
+	blobId: string;
+	isActive: boolean;
+}
+
+/** RFC 8620 §7.1, keyed by account id then by data type name. */
+export interface StateChange {
+	'@type': 'StateChange';
+	changed: Record<
+		string,
+		{
+			Email?: string;
+			Mailbox?: string;
+			Thread?: string;
+			Calendar?: string;
+			CalendarEvent?: string;
+			AddressBook?: string;
+			ContactCard?: string;
+			/** Any other type the server pushes (EmailSubmission, Identity, …). */
+			[type: string]: string | undefined;
+		}
+	>;
+}
+
+export interface JMAPChangesResult {
+	oldState: string;
+	newState: string;
+	hasMoreChanges: boolean;
+	created: string[];
+	updated: string[];
+	destroyed: string[];
+}

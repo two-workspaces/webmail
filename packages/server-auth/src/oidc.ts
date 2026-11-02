@@ -1,0 +1,280 @@
+/**
+ * Minimal OIDC provider core: RS256 keypair, id_token signing, one-time
+ * authorization codes, and PKCE verification. Pure node (no SvelteKit imports)
+ * so `node --test` can exercise it against an in-memory DatabaseSync — the
+ * same split as `store-db.ts`. Shared by webmail and mail2, which keep the env
+ * wiring, the Stalwart identity lookup and the `/oidc/*` routes; both use the
+ * same `oidc_*` tables, so whichever serves the issuer signs with one key.
+ *
+ * Deliberately supports exactly what our relying parties need: authorization
+ * code flow with mandatory PKCE (S256), static clients, RS256 id_tokens, and
+ * signed access tokens good only for userinfo (Vaultwarden requires one).
+ */
+import {
+	createPublicKey,
+	createSign,
+	createVerify,
+	createHash,
+	generateKeyPairSync,
+	randomBytes,
+	timingSafeEqual
+} from 'node:crypto';
+import type { DatabaseSync } from 'node:sqlite';
+
+export interface OidcKeypair {
+	kid: string;
+	privatePem: string;
+	publicPem: string;
+}
+
+export interface AuthCodeData {
+	clientId: string;
+	redirectUri: string;
+	codeChallenge: string;
+	nonce?: string;
+	claims: {
+		sub: string;
+		preferred_username: string;
+		email: string;
+		email_verified?: boolean;
+		name?: string;
+		groups?: string[];
+	};
+}
+
+const b64u = (input: Buffer | string): string => Buffer.from(input).toString('base64url');
+
+function ensureTables(db: DatabaseSync): void {
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS oidc_keys (
+			kid TEXT PRIMARY KEY,
+			private_pem TEXT NOT NULL,
+			public_pem TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS oidc_codes (
+			code TEXT PRIMARY KEY,
+			payload TEXT NOT NULL,
+			expires_at INTEGER NOT NULL
+		);
+	`);
+}
+
+/** Load the signing keypair, generating and persisting one on first use. */
+export function getOrCreateKeypair(db: DatabaseSync): OidcKeypair {
+	ensureTables(db);
+	const row = db.prepare('SELECT kid, private_pem, public_pem FROM oidc_keys LIMIT 1').get() as
+		| { kid: string; private_pem: string; public_pem: string }
+		| undefined;
+	if (row) return { kid: row.kid, privatePem: row.private_pem, publicPem: row.public_pem };
+
+	const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+	const keypair: OidcKeypair = {
+		kid: randomBytes(8).toString('hex'),
+		privatePem: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+		publicPem: publicKey.export({ type: 'spki', format: 'pem' }).toString()
+	};
+	db.prepare('INSERT INTO oidc_keys (kid, private_pem, public_pem, created_at) VALUES (?, ?, ?, ?)').run(
+		keypair.kid,
+		keypair.privatePem,
+		keypair.publicPem,
+		Date.now()
+	);
+	return keypair;
+}
+
+export function publicJwks(keypair: OidcKeypair): { keys: Record<string, unknown>[] } {
+	const jwk = createPublicKey(keypair.publicPem).export({ format: 'jwk' });
+	return { keys: [{ ...jwk, kid: keypair.kid, alg: 'RS256', use: 'sig' }] };
+}
+
+/** `typ: 'at+jwt'` (RFC 9068) marks an access token, so an id_token is never accepted as one. */
+export function signIdToken(keypair: OidcKeypair, claims: Record<string, unknown>, typ = 'JWT'): string {
+	const header = b64u(JSON.stringify({ alg: 'RS256', typ, kid: keypair.kid }));
+	const payload = b64u(JSON.stringify(claims));
+	const signature = createSign('RSA-SHA256')
+		.update(`${header}.${payload}`)
+		.sign(keypair.privatePem)
+		.toString('base64url');
+	return `${header}.${payload}.${signature}`;
+}
+
+/** The claims of an unexpired access token we signed (for /oidc/userinfo), else null. */
+export function verifyAccessToken(
+	keypair: OidcKeypair,
+	token: string,
+	now = Date.now()
+): Record<string, unknown> | null {
+	const [header, payload, signature, extra] = token.split('.');
+	if (!header || !payload || !signature || extra !== undefined) return null;
+	try {
+		const h = JSON.parse(Buffer.from(header, 'base64url').toString()) as Record<string, unknown>;
+		if (h.alg !== 'RS256' || h.typ !== 'at+jwt' || h.kid !== keypair.kid) return null;
+		const valid = createVerify('RSA-SHA256')
+			.update(`${header}.${payload}`)
+			.verify(keypair.publicPem, Buffer.from(signature, 'base64url'));
+		if (!valid) return null;
+		const claims = JSON.parse(Buffer.from(payload, 'base64url').toString()) as Record<string, unknown>;
+		return typeof claims.exp === 'number' && claims.exp * 1000 > now ? claims : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Store any JSON payload under a random one-time code (shared table with auth codes). */
+export function createOneTimeCode(db: DatabaseSync, payload: unknown, ttlMs: number, now = Date.now()): string {
+	ensureTables(db);
+	db.prepare('DELETE FROM oidc_codes WHERE expires_at < ?').run(now);
+	const code = randomBytes(32).toString('base64url');
+	db.prepare('INSERT INTO oidc_codes (code, payload, expires_at) VALUES (?, ?, ?)').run(
+		code,
+		JSON.stringify(payload),
+		now + ttlMs
+	);
+	return code;
+}
+
+/** One-time: the row is deleted whether or not it is still valid. */
+export function consumeOneTimeCode<T>(db: DatabaseSync, code: string, now = Date.now()): T | null {
+	ensureTables(db);
+	const row = db.prepare('SELECT payload, expires_at FROM oidc_codes WHERE code = ?').get(code) as
+		| { payload: string; expires_at: number }
+		| undefined;
+	if (row) db.prepare('DELETE FROM oidc_codes WHERE code = ?').run(code);
+	if (!row || row.expires_at < now) return null;
+	return JSON.parse(row.payload) as T;
+}
+
+export function createAuthCode(db: DatabaseSync, data: AuthCodeData, ttlMs: number, now = Date.now()): string {
+	return createOneTimeCode(db, data, ttlMs, now);
+}
+
+export function consumeAuthCode(db: DatabaseSync, code: string, now = Date.now()): AuthCodeData | null {
+	return consumeOneTimeCode<AuthCodeData>(db, code, now);
+}
+
+export function verifyPkceS256(verifier: string, challenge: string): boolean {
+	if (!verifier || !challenge) return false;
+	const computed = Buffer.from(createHash('sha256').update(verifier).digest('base64url'));
+	const expected = Buffer.from(challenge);
+	return computed.length === expected.length && timingSafeEqual(computed, expected);
+}
+
+export function secretsEqual(a: string, b: string): boolean {
+	const ba = Buffer.from(a);
+	const bb = Buffer.from(b);
+	return ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
+export function discoveryDocument(origin: string): Record<string, unknown> {
+	return {
+		issuer: origin,
+		authorization_endpoint: `${origin}/oidc/authorize`,
+		token_endpoint: `${origin}/oidc/token`,
+		userinfo_endpoint: `${origin}/oidc/userinfo`,
+		end_session_endpoint: `${origin}/oidc/logout`,
+		jwks_uri: `${origin}/oidc/jwks`,
+		response_types_supported: ['code'],
+		grant_types_supported: ['authorization_code'],
+		subject_types_supported: ['public'],
+		id_token_signing_alg_values_supported: ['RS256'],
+		scopes_supported: ['openid', 'email', 'profile'],
+		token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
+		code_challenge_methods_supported: ['S256'],
+		claims_supported: ['sub', 'preferred_username', 'email', 'email_verified', 'name', 'groups']
+	};
+}
+
+/**
+ * Whether a request is the browser arriving at a page, not something a page
+ * embeds. Signing out (and the signup handoff's sign-in) answer a plain GET,
+ * because relying parties send the browser there as a navigation — so an
+ * <img>, a fetch() or a frame pointed at the same address must not count:
+ * `<img src="/oidc/logout">` in a mail was a sign-out on open. Browsers say
+ * which it is in `Sec-Fetch-Dest`; one too old to send it is let through, as before.
+ */
+export function isNavigation(headers: Headers): boolean {
+	const dest = headers.get('sec-fetch-dest');
+	return dest === null || dest === 'document';
+}
+
+/**
+ * Where to send the browser after RP-initiated logout: the requested
+ * post_logout_redirect_uri if its origin matches a registered redirect_uri
+ * (so a stray link can't bounce a signed-out user to an attacker), else null.
+ */
+export function postLogoutTarget(
+	requested: string | null,
+	state: string | null,
+	registeredRedirectUris: string[]
+): string | null {
+	if (!requested) return null;
+	let target: URL;
+	try {
+		target = new URL(requested);
+	} catch {
+		return null;
+	}
+	const allowed = registeredRedirectUris.some((uri) => {
+		try {
+			return new URL(uri).origin === target.origin;
+		} catch {
+			return false;
+		}
+	});
+	if (!allowed || (target.protocol !== 'https:' && target.hostname !== 'localhost')) return null;
+	if (state) target.searchParams.set('state', state);
+	return target.toString();
+}
+
+export interface OidcClient {
+	clientId: string;
+	clientSecret: string;
+	redirectUris: string[];
+	/** Shown on the login page: "Sign in to continue to <name>". */
+	name: string;
+}
+
+/**
+ * Client registry. OIDC_PROVIDER_CLIENTS is a JSON array of
+ * {clientId, clientSecret, redirectUris, name?}; the legacy single-client
+ * env triple is appended so existing deployments keep working unchanged.
+ * Malformed entries are dropped rather than taking the provider down.
+ */
+export function parseOidcClients(
+	json: string | undefined,
+	legacy: { clientId?: string; clientSecret?: string; redirectUris?: string; name?: string }
+): OidcClient[] {
+	const clients: OidcClient[] = [];
+	const add = (raw: unknown) => {
+		if (!raw || typeof raw !== 'object') return;
+		const r = raw as Record<string, unknown>;
+		const clientId = typeof r.clientId === 'string' ? r.clientId.trim() : '';
+		const clientSecret = typeof r.clientSecret === 'string' ? r.clientSecret.trim() : '';
+		const uris = (Array.isArray(r.redirectUris) ? r.redirectUris : String(r.redirectUris ?? '').split(','))
+			.map((u) => String(u).trim())
+			.filter(Boolean);
+		if (!clientId || !clientSecret || uris.length === 0) return;
+		let name = typeof r.name === 'string' && r.name.trim() ? r.name.trim() : '';
+		if (!name) {
+			// "bartube.zaur.app" → "Bartube": good enough for "continue to …" without config.
+			try {
+				const label = new URL(uris[0]).hostname.split('.')[0];
+				name = label.charAt(0).toUpperCase() + label.slice(1);
+			} catch {
+				name = clientId;
+			}
+		}
+		clients.push({ clientId, clientSecret, redirectUris: uris, name });
+	};
+	if (json?.trim()) {
+		try {
+			const parsed = JSON.parse(json) as unknown;
+			if (Array.isArray(parsed)) parsed.forEach(add);
+		} catch {
+			// ignore — legacy vars below may still configure a client
+		}
+	}
+	add(legacy);
+	return clients;
+}

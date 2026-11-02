@@ -1,0 +1,210 @@
+<script lang="ts">
+	import type { Calendar, CalendarEvent } from '@zaur/mail-core';
+	import { calendarKey, isRecurringInstance, recurrenceFrom } from '@zaur/mail-core';
+	import { formatEventTime } from '@zaur/mail-core/utils/dates';
+	import { extractMeetingGroup } from '@zaur/mail-core/utils/meet';
+	import { describeRepeat } from '#lib/calendar/schedule';
+	import { isHolidays } from '#lib/calendar/holidays';
+	import { isFeed } from '#lib/calendar/feeds';
+	import MeetIcon from '../meet/MeetIcon.svelte';
+	import { eventParticipants, replyToEvent, type EventParticipant } from '../../../routes/calendar.remote';
+	import { messageOf } from '#lib/errors';
+
+	/**
+	 * An event as it is, before anyone edits it — what a click on the grid or
+	 * the day list opens, as 1.0's event panel did. An event you may change has
+	 * Edit and Delete here; one from a calendar you can only read (a holiday
+	 * feed, somebody else's calendar) has nothing to press but Join and Close.
+	 */
+	let {
+		event,
+		calendars,
+		writable,
+		busy = false,
+		error = null,
+		onEdit,
+		onDelete,
+		onClose
+	}: {
+		event: CalendarEvent;
+		/** The calendars it is filed in, where they are known. */
+		calendars: Calendar[];
+		writable: boolean;
+		busy?: boolean;
+		/** A delete that failed. */
+		error?: string | null;
+		onEdit: () => void;
+		onDelete: () => void;
+		onClose: () => void;
+	} = $props();
+
+	const medium = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
+	// The shared formatter says only "All day"; here the days are the point. The
+	// end is exclusive midnight, so the last day covered is the one before it.
+	const when = $derived.by(() => {
+		if (!event.allDay) return formatEventTime(event);
+		const last = new Date(event.end.getTime() - 1);
+		const first = medium.format(event.start);
+		return `${last.toDateString() === event.start.toDateString() ? first : `${first} – ${medium.format(last)}`} · All day`;
+	});
+	const meeting = $derived(extractMeetingGroup(event.location));
+	const repeats = $derived(
+		describeRepeat(recurrenceFrom(event.recurrenceRule, event.start), event.start) ??
+			(isRecurringInstance(event) ? 'Repeats' : null)
+	);
+	// Guests, read-only: the series' list for an occurrence. A failed load shows nothing.
+	// A holiday has none, and no JMAP account to ask.
+	const guests = $derived(
+		isHolidays(event) || isFeed(event) ? null : eventParticipants({ id: event.baseEventId ?? event.id, accountId: event.accountId })
+	);
+	const answered: Record<EventParticipant['status'], string> = {
+		accepted: 'Going',
+		tentative: 'Maybe',
+		declined: 'Not going',
+		'needs-action': 'No reply yet'
+	};
+	const label = 'z-caption mb-1';
+
+	/** You, on the guest list: the one answer this panel can change. */
+	const mine = $derived(guests?.current?.find((guest) => guest.me && !guest.organizer) ?? null);
+	const others = $derived(guests?.current?.filter((guest) => !guest.me && guest.email) ?? []);
+	let answering = $state<EventParticipant['status'] | null>(null);
+	let answerError = $state<string | null>(null);
+	async function answer(status: 'accepted' | 'tentative' | 'declined') {
+		if (!guests || mine?.status === status) return;
+		answering = status;
+		answerError = null;
+		try {
+			await replyToEvent({ id: event.baseEventId ?? event.id, accountId: event.accountId, status });
+			await guests.refresh();
+		} catch (cause) {
+			answerError = messageOf(cause, 'Your answer could not be sent.');
+		} finally {
+			answering = null;
+		}
+	}
+	const ANSWERS = [
+		['accepted', 'Going'],
+		['tentative', 'Maybe'],
+		['declined', 'Not going']
+	] as const;
+</script>
+
+<div class="flex h-full flex-col">
+	<div class="flex items-center justify-between gap-3 border-b border-[var(--z-hairline)] px-6 py-3 max-md:px-4">
+		<h2 class="text-[14px] font-semibold text-[var(--z-ink)]">Event</h2>
+		<div class="flex items-center gap-2">
+			{#if writable}
+				<button type="button" class="btn-tactile btn-danger !h-[30px]" onclick={onDelete} disabled={busy}>Delete</button>
+				<button type="button" class="btn-tactile !h-[30px]" onclick={onEdit} disabled={busy}>Edit</button>
+			{/if}
+			<button type="button" class="btn-tactile !h-[30px]" onclick={onClose}>Close</button>
+		</div>
+	</div>
+
+	<div class="min-h-0 flex-1 overflow-y-auto px-6 py-5 max-md:px-4">
+		<div class="mx-auto flex max-w-[560px] flex-col gap-5">
+			{#if error}
+				<p class="z-railed z-alert z-tone-discard" role="alert">{error}</p>
+			{/if}
+			<div>
+				<p class="text-[17px] leading-snug font-semibold text-[var(--z-ink)]">{event.title}</p>
+				<p class="mt-1 text-[13.5px] text-[var(--z-body)]">{when}</p>
+				{#if repeats}<p class="mt-0.5 text-[12.5px] text-[var(--z-soft)]">{repeats}</p>{/if}
+			</div>
+
+			{#if mine}
+				<!-- An invitation is answered where it is read, not in a mail client's buttons. -->
+				<div>
+					<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
+						<span class="text-[13.5px] font-medium text-[var(--z-strong)]">{mine.status === 'needs-action' ? 'Are you going?' : 'Your answer'}</span>
+						<div class="z-group" role="group" aria-label="Your answer">
+							{#each ANSWERS as [status, text] (status)}
+								<button type="button" class="z-segment" aria-pressed={mine.status === status} disabled={answering !== null} onclick={() => answer(status)}>
+									{answering === status ? 'Sending…' : text}
+								</button>
+							{/each}
+						</div>
+					</div>
+					{#if answerError}
+						<p class="mt-1.5 text-[12.5px] text-[var(--z-ch-discard-ink)]" role="alert">{answerError}</p>
+					{:else}
+						<p class="mt-1.5 text-[12px] text-[var(--z-soft)]">The organiser is told by mail{isRecurringInstance(event) ? ', for every occurrence' : ''}.</p>
+					{/if}
+				</div>
+			{/if}
+
+			{#if meeting}
+				<div class="flex items-center gap-2.5 rounded-[10px] border border-[var(--z-accent-stroke)] bg-[var(--z-accent-tint)] p-3 text-[var(--z-accent-ink)]">
+					<span class="flex size-[30px] shrink-0 items-center justify-center rounded-[8px] border border-current/40 bg-[var(--z-surface)]">
+						<MeetIcon name="cam" />
+					</span>
+					<span class="min-w-0 flex-1">
+						<span class="block text-[13.5px] font-semibold">Video call</span>
+						<span class="z-mono block truncate text-[11.5px] opacity-85">{event.location}</span>
+					</span>
+					<a class="btn-tactile btn-primary !h-[30px] shrink-0" href="/meet/{meeting}" target="_blank" rel="noopener">Join</a>
+				</div>
+			{:else if event.location}
+				<div>
+					<h3 class={label}>Where</h3>
+					<p class="text-[13.5px] text-[var(--z-body)]">{event.location}</p>
+				</div>
+			{/if}
+
+			{#if calendars.length}
+				<div>
+					<h3 class={label}>Calendar</h3>
+					<ul role="list">
+						{#each calendars as calendar (calendarKey(calendar))}
+							<li class="flex items-center gap-2 text-[13.5px] text-[var(--z-body)]">
+								<span class="size-2.5 shrink-0 rounded-full" style:background={calendar.color} aria-hidden="true"></span>
+								{calendar.name}
+							</li>
+						{/each}
+					</ul>
+					{#if !writable}
+						<p class="mt-1 text-[12.5px] text-[var(--z-soft)]">You can see this calendar but not change it.</p>
+					{/if}
+				</div>
+			{/if}
+
+			{#if guests?.current?.length}
+				<div>
+					<div class="flex items-baseline justify-between gap-3">
+						<h3 class={label}>Guests</h3>
+						{#if others.length}
+							<a
+								class="text-[12.5px] font-medium text-[var(--z-accent)] hover:underline"
+								href="/?to={encodeURIComponent(others.map((guest) => guest.email).join(','))}&subject={encodeURIComponent(event.title)}"
+							>
+								Email guests
+							</a>
+						{/if}
+					</div>
+					<ul class="flex flex-col gap-1.5" role="list">
+						<!-- By position: an invitation can list one address twice, and a key must not. -->
+						{#each guests.current as guest, index (index)}
+							<li class="flex items-baseline justify-between gap-3 text-[13.5px] text-[var(--z-body)]">
+								<span class="min-w-0">
+									<span class="block truncate">{guest.name}{guest.organizer ? ' · Organiser' : ''}</span>
+									{#if guest.email && guest.email !== guest.name}
+										<span class="z-mono block truncate text-[11.5px] text-[var(--z-soft)]">{guest.email}</span>
+									{/if}
+								</span>
+								<span class="shrink-0 text-[12.5px] text-[var(--z-soft)]">{answered[guest.status]}</span>
+							</li>
+						{/each}
+					</ul>
+				</div>
+			{/if}
+
+			{#if event.description?.trim()}
+				<div>
+					<h3 class={label}>Notes</h3>
+					<p class="text-[13.5px] leading-relaxed whitespace-pre-wrap break-words text-[var(--z-body)]">{event.description.trim()}</p>
+				</div>
+			{/if}
+		</div>
+	</div>
+</div>

@@ -1,0 +1,504 @@
+/**
+ * Calendar over JMAP Calendars, on the client mail-core already carried for
+ * webmail 1.0. Two things are different here:
+ *
+ * - Recurring events are expanded **by the server** (`expandRecurrences`,
+ *   which Stalwart implements now), so a weekly meeting is a row per week
+ *   with a synthetic id, and editing one asks whether it is this occurrence
+ *   or the series. 1.0 expanded client-side against a local copy.
+ * - Dates cross the wire as `Date` (devalue handles them); the browser owns
+ *   the time zone and sends it with every query, because the server's clock
+ *   is not the person's.
+ */
+import * as v from 'valibot';
+import { error } from '@sveltejs/kit';
+import { command, query } from '$app/server';
+import {
+	JmapMethodError,
+	isJmapMethodError,
+	mapCalendar,
+	mapCalendarEvent,
+	recurrenceRuleFrom,
+	rightsForShareRole,
+	type Calendar,
+	type CalendarEvent,
+	type EventRecurrence,
+	type JMAPClient,
+	type JMAPPrincipal
+} from '@zaur/mail-core';
+import { connect, requireAccount } from '#lib/server/account';
+import { pickPrincipal } from '#lib/share';
+
+const LOCAL_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/;
+const ISO_DURATION = /^P(?!$)(\d+D)?(T(?=\d)(\d+H)?(\d+M)?)?$/;
+const TIME_ZONE = v.pipe(v.string(), v.minLength(1), v.maxLength(64), v.regex(/^[A-Za-z0-9_+\-/]+$/));
+const ID = v.pipe(v.string(), v.minLength(1), v.maxLength(200));
+const ACCOUNT = v.optional(v.nullable(v.pipe(v.string(), v.maxLength(200))));
+const COLOR = v.pipe(v.string(), v.regex(/^#[0-9a-fA-F]{6}$/));
+const ROLE = v.picklist(['read', 'write']);
+
+export interface CalendarsState {
+	supported: boolean;
+	calendars: Calendar[];
+	/** Your own calendar account. Anything else in the list was shared with you. */
+	primaryAccountId: string | null;
+	/** The server has a directory of people (JMAP Principals) to share with. */
+	canShare: boolean;
+}
+
+function rethrow(cause: unknown): never {
+	if (cause instanceof JmapMethodError) error(400, cause.message);
+	if (cause instanceof Error && /not supported|Calendars not/i.test(cause.message)) error(501, cause.message);
+	throw cause;
+}
+
+export const calendars = query(async (): Promise<CalendarsState> => {
+	const client = await connect();
+	if (!client.hasCalendars()) return { supported: false, calendars: [], primaryAccountId: null, canShare: false };
+	const list = await client.getCalendars();
+	return {
+		supported: true,
+		calendars: list.map((calendar, index) => mapCalendar(calendar, index, calendar.accountId)),
+		primaryAccountId: client.getCalendarAccountId() || null,
+		canShare: client.hasPrincipals()
+	};
+});
+
+/**
+ * Events in a window, expanded. `after`/`before` are local date-times in
+ * `timeZone` (JMAP's wire form for query bounds); a month view asks for its
+ * six-week grid so the edges are filled too.
+ */
+export const events = query(
+	v.object({
+		after: v.pipe(v.string(), v.regex(LOCAL_DATETIME)),
+		before: v.pipe(v.string(), v.regex(LOCAL_DATETIME)),
+		timeZone: TIME_ZONE
+	}),
+	async ({ after, before, timeZone }): Promise<CalendarEvent[]> => {
+		const client = await connect();
+		if (!client.hasCalendars()) return [];
+		try {
+			const { events: list } = await client.queryCalendarEvents({
+				after,
+				before,
+				timeZone,
+				expandRecurrences: true
+			});
+			return list
+				.map((event) => mapCalendarEvent(event, event.accountId))
+				.sort((a, b) => a.start.getTime() - b.start.getTime() || a.title.localeCompare(b.title));
+		} catch (cause) {
+			rethrow(cause);
+		}
+	}
+);
+
+export interface EventParticipant {
+	name: string;
+	email: string;
+	/** What they answered; `needs-action` until they do. */
+	status: 'accepted' | 'declined' | 'tentative' | 'needs-action';
+	organizer: boolean;
+	/** The signed-in person: the one whose answer can be changed here. */
+	me: boolean;
+}
+
+interface RawParticipant {
+	name?: string;
+	email?: string;
+	calendarAddress?: string;
+	sendTo?: Record<string, string>;
+	roles?: Record<string, boolean>;
+	participationStatus?: string;
+}
+
+/** JSCalendar has moved the address around: `email`, then `calendarAddress`, with `sendTo.imip` throughout. */
+const addressOf = (person: RawParticipant) =>
+	(person.email ?? person.calendarAddress ?? person.sendTo?.imip ?? '').replace(/^mailto:/i, '');
+
+const CALENDARS = ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:calendars'];
+
+async function participantsOf(client: JMAPClient, accountId: string, id: string): Promise<Record<string, RawParticipant>> {
+	const response = await client.request([['CalendarEvent/get', { accountId, ids: [id], properties: ['participants'] }, 'p']], CALENDARS);
+	const [found] = (response.methodResponses?.[0]?.[1]?.list as { participants?: Record<string, RawParticipant> | null }[] | undefined) ?? [];
+	return found?.participants ?? {};
+}
+
+/**
+ * Who an event was sent to and what each answered — read-only, asked for when
+ * an event is opened. mail-core's event list does not carry participants, and
+ * an invitation that arrived by mail should at least say who else is coming.
+ * For an occurrence, pass the series' id: the list is the series'.
+ */
+export const eventParticipants = query(
+	v.object({ id: ID, accountId: ACCOUNT }),
+	async ({ id, accountId }): Promise<EventParticipant[]> => {
+		const me = requireAccount().username.toLowerCase();
+		const client = await connect();
+		if (!client.hasCalendars()) return [];
+		const participants = await participantsOf(client, accountId ?? client.getCalendarAccountId(), id);
+		return Object.values(participants)
+			.map((person): EventParticipant => {
+				const email = addressOf(person);
+				const status = person.participationStatus;
+				return {
+					name: person.name?.trim() || email,
+					email,
+					status: status === 'accepted' || status === 'declined' || status === 'tentative' ? status : 'needs-action',
+					organizer: Boolean(person.roles?.owner || person.roles?.chair),
+					me: email.toLowerCase() === me
+				};
+			})
+			.filter((person) => person.name)
+			.sort((a, b) => Number(b.organizer) - Number(a.organizer) || a.name.localeCompare(b.name));
+	}
+);
+
+/**
+ * Your answer to an invitation: your own participant's status, and the
+ * server tells the organiser (`sendSchedulingMessages`, an iTIP REPLY by mail).
+ * For an occurrence, pass the series' id: the answer is to the series.
+ */
+export const replyToEvent = command(
+	v.object({ id: ID, accountId: ACCOUNT, status: v.picklist(['accepted', 'tentative', 'declined']) }),
+	async ({ id, accountId, status }): Promise<void> => {
+		const me = requireAccount().username.toLowerCase();
+		const client = await connect();
+		if (!client.hasCalendars()) error(501, 'This mail server does not offer calendars over JMAP.');
+		const account = accountId ?? client.getCalendarAccountId();
+		const participants = await participantsOf(client, account, id);
+		const key = Object.keys(participants).find((key) => addressOf(participants[key]!).toLowerCase() === me);
+		if (!key) error(400, 'You are not on this event’s guest list.');
+		const response = await client.request(
+			[['CalendarEvent/set', { accountId: account, sendSchedulingMessages: true, update: { [id]: { [`participants/${key}/participationStatus`]: status } } }, 's']],
+			CALENDARS
+		);
+		const [method, set] = response.methodResponses?.[0] ?? [];
+		const refused = method === 'error' ? set : (set as { notUpdated?: Record<string, unknown> })?.notUpdated?.[id];
+		if (refused) error(400, (refused as { description?: string }).description ?? 'Your answer could not be saved.');
+	}
+);
+
+const eventInput = v.object({
+	calendarId: ID,
+	accountId: v.optional(v.nullable(v.pipe(v.string(), v.maxLength(200)))),
+	title: v.pipe(v.string(), v.trim(), v.minLength(1, 'Give the event a title'), v.maxLength(500)),
+	/** Local date-time without offset, interpreted in `timeZone`. */
+	start: v.pipe(v.string(), v.regex(LOCAL_DATETIME)),
+	duration: v.pipe(v.string(), v.regex(ISO_DURATION)),
+	timeZone: TIME_ZONE,
+	allDay: v.boolean(),
+	description: v.pipe(v.string(), v.maxLength(10_000)),
+	location: v.pipe(v.string(), v.maxLength(500)),
+	/** `null` does not repeat. `count` and `until` are exclusive; count wins. */
+	recurrence: v.nullable(
+		v.object({
+			frequency: v.picklist(['daily', 'weekly', 'monthly', 'yearly']),
+			interval: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(999)),
+			byDay: v.pipe(v.array(v.picklist(['mo', 'tu', 'we', 'th', 'fr', 'sa', 'su'])), v.maxLength(7)),
+			until: v.optional(v.pipe(v.string(), v.regex(LOCAL_DATETIME))),
+			count: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(999)))
+		})
+	)
+});
+
+export const createEvent = command(eventInput, async (input): Promise<{ id: string }> => {
+	const client = await connect();
+	try {
+		const id = await client.createCalendarEvent({
+			calendarId: input.calendarId,
+			accountId: input.accountId ?? null,
+			title: input.title,
+			start: input.start,
+			duration: input.duration,
+			timeZone: input.timeZone,
+			showWithoutTime: input.allDay,
+			description: input.description.trim() || undefined,
+			location: input.location.trim() || undefined,
+			recurrenceRule: recurrenceRuleFrom(input.recurrence as EventRecurrence | null)
+		});
+		return { id };
+	} catch (cause) {
+		rethrow(cause);
+	}
+});
+
+/**
+ * Update an event — the master when `id` is a real id, one occurrence when it
+ * is a synthetic instance id (Stalwart records a recurrence override).
+ * `previousCalendarIds` lets a move between calendars unfile from the old one.
+ */
+export const updateEvent = command(
+	v.object({
+		id: ID,
+		previousCalendarIds: v.pipe(v.array(ID), v.maxLength(20)),
+		/**
+		 * One occurrence of a series leaves the rule alone: Stalwart records the
+		 * edit as an override, and writing a rule onto an override would rewrite
+		 * the series from one of its own instances.
+		 */
+		keepRecurrence: v.optional(v.boolean()),
+		/**
+		 * `id` is a synthetic occurrence id, so the patch is an override and
+		 * carries only what one occurrence owns. It implies `keepRecurrence`;
+		 * a drag sets that on its own, for a master event too, because moving
+		 * an event never edits the rule behind it.
+		 */
+		occurrence: v.optional(v.boolean()),
+		...eventInput.entries
+	}),
+	async (input): Promise<{ ok: true }> => {
+		const client = await connect();
+		try {
+			await client.updateCalendarEvent(input.id, {
+				calendarId: input.calendarId,
+				accountId: input.accountId ?? null,
+				title: input.title,
+				start: input.start,
+				duration: input.duration,
+				timeZone: input.timeZone,
+				showWithoutTime: input.allDay,
+				description: input.description.trim() || undefined,
+				location: input.location.trim() || undefined,
+				previousCalendarIds: input.previousCalendarIds,
+				occurrence: input.occurrence,
+				// `undefined` leaves it alone; `null` clears it; a rule sets it.
+				// Until now nothing was sent at all, so a changed rule was dropped.
+				recurrenceRule:
+					input.keepRecurrence || input.occurrence
+						? undefined
+						: (recurrenceRuleFrom(input.recurrence as EventRecurrence | null) ?? null)
+			});
+			return { ok: true };
+		} catch (cause) {
+			rethrow(cause);
+		}
+	}
+);
+
+export const deleteEvent = command(
+	v.object({ id: ID, accountId: v.optional(v.nullable(v.pipe(v.string(), v.maxLength(200)))) }),
+	async ({ id, accountId }): Promise<{ ok: true }> => {
+		const client = await connect();
+		try {
+			await client.destroyCalendarEvent(id, accountId ?? null);
+			return { ok: true };
+		} catch (cause) {
+			rethrow(cause);
+		}
+	}
+);
+
+export interface ImportResult {
+	imported: number;
+	/** Already in the account: a file imported twice adds nothing. */
+	existing: number;
+	failed: number;
+	/** The first reason one was refused, to show with the count. */
+	reason?: string;
+}
+
+const IMPORT_BATCH = 50;
+
+/**
+ * An .ics file into a calendar. The server reads it (`CalendarEvent/parse`),
+ * so a repeating event arrives as one series with its rule, time zone and
+ * exceptions rather than as copies; each is then created in the calendar.
+ * Nobody is sent an invitation: `sendSchedulingMessages` stays off.
+ */
+export const importEvents = command(
+	v.object({
+		calendarId: ID,
+		accountId: ACCOUNT,
+		ics: v.pipe(v.string(), v.minLength(1), v.maxLength(20_000_000))
+	}),
+	async ({ calendarId, accountId, ics }): Promise<ImportResult> => {
+		const client = await connect();
+		if (!client.hasCalendars()) error(501, 'This mail server does not offer calendars over JMAP.');
+		if (!/^\s*BEGIN:VCALENDAR/i.test(ics.replace(/^﻿/, ''))) error(400, 'That file is not an iCalendar (.ics) file.');
+		const using = ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:calendars', 'urn:ietf:params:jmap:calendars:parse'];
+		try {
+			const { blobId } = await client.uploadBlob(new Blob([ics], { type: 'text/calendar' }), 'text/calendar');
+			const parsedResponse = await client.request(
+				[['CalendarEvent/parse', { accountId: client.getCalendarAccountId(), blobIds: [blobId] }, 'p']],
+				using
+			);
+			const [name, answer] = parsedResponse.methodResponses?.[0] ?? [];
+			if (name === 'error') error(400, (answer as { description?: string })?.description ?? 'The server could not read that file.');
+			const parsed = ((answer as { parsed?: Record<string, Record<string, unknown>[]> })?.parsed?.[blobId] ?? []).filter(
+				(event) => event['@type'] === 'Event'
+			);
+			if (!parsed.length) error(400, 'There are no events in that file.');
+
+			const result: ImportResult = { imported: 0, existing: 0, failed: 0 };
+			for (let at = 0; at < parsed.length; at += IMPORT_BATCH) {
+				const batch = parsed.slice(at, at + IMPORT_BATCH);
+				const create = Object.fromEntries(batch.map((event, i) => [`i${at + i}`, { ...event, calendarIds: { [calendarId]: true } }]));
+				const response = await client.request(
+					[['CalendarEvent/set', { accountId: accountId ?? client.getCalendarAccountId(), sendSchedulingMessages: false, create }, 's']],
+					using
+				);
+				const [method, set] = response.methodResponses?.[0] ?? [];
+				if (method === 'error') error(400, (set as { description?: string })?.description ?? 'The events could not be saved.');
+				const { created, notCreated } = set as {
+					created?: Record<string, unknown>;
+					notCreated?: Record<string, { type?: string; description?: string; properties?: string[] }>;
+				};
+				result.imported += Object.keys(created ?? {}).length;
+				for (const refused of Object.values(notCreated ?? {})) {
+					// Stalwart: "An event with UID … already exists."
+					if (refused.properties?.includes('uid') && /exist/i.test(refused.description ?? '')) result.existing++;
+					else {
+						result.failed++;
+						result.reason ??= refused.description ?? refused.type;
+					}
+				}
+			}
+			return result;
+		} catch (cause) {
+			rethrow(cause);
+		}
+	}
+);
+
+export const setCalendarVisible = command(
+	v.object({
+		id: ID,
+		accountId: v.optional(v.nullable(v.pipe(v.string(), v.maxLength(200)))),
+		visible: v.boolean()
+	}),
+	async ({ id, accountId, visible }): Promise<{ ok: true }> => {
+		const client = await connect();
+		try {
+			await client.updateCalendar(id, { isVisible: visible, accountId: accountId ?? null });
+			void calendars().refresh();
+			return { ok: true };
+		} catch (cause) {
+			rethrow(cause);
+		}
+	}
+);
+
+export const createCalendar = command(
+	v.object({
+		name: v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(200)),
+		color: v.optional(COLOR)
+	}),
+	async ({ name, color }): Promise<{ id: string }> => {
+		const client = await connect();
+		try {
+			const id = await client.createCalendar({ name, color });
+			void calendars().refresh();
+			return { id };
+		} catch (cause) {
+			rethrow(cause);
+		}
+	}
+);
+
+export const updateCalendar = command(
+	v.object({
+		id: ID,
+		accountId: ACCOUNT,
+		name: v.pipe(v.string(), v.trim(), v.minLength(1, 'Give the calendar a name'), v.maxLength(200)),
+		color: COLOR
+	}),
+	async ({ id, accountId, name, color }): Promise<{ ok: true }> => {
+		const client = await connect();
+		try {
+			await client.updateCalendar(id, { name, color, accountId: accountId ?? null });
+			void calendars().refresh();
+			return { ok: true };
+		} catch (cause) {
+			rethrow(cause);
+		}
+	}
+);
+
+/** Where a new event lands. Only your own account has one: the flag is per account. */
+export const makeDefaultCalendar = command(v.object({ id: ID }), async ({ id }): Promise<{ ok: true }> => {
+	const client = await connect();
+	try {
+		await client.setDefaultCalendar(id);
+		void calendars().refresh();
+		return { ok: true };
+	} catch (cause) {
+		rethrow(cause);
+	}
+});
+
+/**
+ * The server refuses a calendar that still holds events unless told to take
+ * them too, so the first try asks for the calendar alone and says whether
+ * there was anything in it; only a second, confirmed try removes the events.
+ */
+export const deleteCalendar = command(
+	v.object({ id: ID, accountId: ACCOUNT, removeEvents: v.boolean() }),
+	async ({ id, accountId, removeEvents }): Promise<{ deleted: boolean }> => {
+		const client = await connect();
+		try {
+			await client.destroyCalendar(id, removeEvents, accountId ?? null);
+		} catch (cause) {
+			if (isJmapMethodError(cause, 'calendarHasEvent')) return { deleted: false };
+			rethrow(cause);
+		}
+		void calendars().refresh();
+		return { deleted: true };
+	}
+);
+
+/** Names for the people a calendar is shared with; the calendar itself only has their ids. */
+export const sharePeople = query(
+	v.pipe(v.array(ID), v.maxLength(200)),
+	async (ids): Promise<JMAPPrincipal[]> => {
+		const client = await connect();
+		// A server that will not say who someone is still shares with them: ids it is.
+		return client.getPrincipals(ids).catch(() => []);
+	}
+);
+
+/** Share by address. The address is looked up in the server's directory — see `pickPrincipal`. */
+export const shareCalendar = command(
+	v.object({
+		id: ID,
+		accountId: ACCOUNT,
+		email: v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(320)),
+		role: ROLE
+	}),
+	async ({ id, accountId, email, role }): Promise<{ person: JMAPPrincipal }> => {
+		const client = await connect();
+		try {
+			const pick = pickPrincipal(await client.queryPrincipals(email), email, client.getCurrentUserPrincipalId());
+			if ('error' in pick) error(400, pick.error);
+			await client.updateCalendar(id, {
+				shareWith: { [pick.person.id]: rightsForShareRole(role) },
+				accountId: accountId ?? null
+			});
+			void calendars().refresh();
+			return { person: pick.person };
+		} catch (cause) {
+			if (isJmapMethodError(cause, 'forbidden'))
+				error(400, 'This server does not let you look people up. Ask its admin to allow directory queries.');
+			rethrow(cause);
+		}
+	}
+);
+
+/** Change what one person may do with a calendar, or (`role: null`) take it away from them. */
+export const setCalendarShare = command(
+	v.object({ id: ID, accountId: ACCOUNT, principalId: ID, role: v.nullable(ROLE) }),
+	async ({ id, accountId, principalId, role }): Promise<{ ok: true }> => {
+		const client = await connect();
+		try {
+			await client.updateCalendar(id, {
+				shareWith: { [principalId]: role ? rightsForShareRole(role) : null },
+				accountId: accountId ?? null
+			});
+			void calendars().refresh();
+			return { ok: true };
+		} catch (cause) {
+			rethrow(cause);
+		}
+	}
+);

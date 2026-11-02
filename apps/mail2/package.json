@@ -1,0 +1,54 @@
+{
+	"name": "@zaur/mail2",
+	"private": true,
+	"license": "AGPL-3.0-only",
+	"version": "2.0.0",
+	"type": "module",
+	"imports": {
+		"#lib/*": "./src/lib/*"
+	},
+	"scripts": {
+		"dev": "node --env-file-if-exists=.env node_modules/vite/bin/vite.js dev --port 5175",
+		"build": "vite build",
+		"preview": "vite preview",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && tsc --noEmit -p src/service-worker",
+		"test": "node --import tsx --test tests/*.test.ts",
+		"smoke:jmap": "node tests/smoke/fake-jmap.mjs",
+		"smoke:seed": "node --import tsx tests/smoke/seed-session.ts"
+	},
+	"devDependencies": {
+		"@sveltejs/adapter-node": "^6.0.0",
+		"@sveltejs/kit": "^3.0.1",
+		"@sveltejs/vite-plugin-svelte": "^7.3.1",
+		"@tailwindcss/vite": "^4.3.3",
+		"@types/node": "^25.9.1",
+		"@types/web-push": "^3.6.4",
+		"svelte": "^5.57.2",
+		"svelte-check": "^4.7.6",
+		"tailwindcss": "^4.3.3",
+		"tsx": "^4.23.13",
+		"typescript": "^6.0.2",
+		"vite": "^8.3.4"
+	},
+	"dependencies": {
+		"@ark-ui/svelte": "^5.24.3",
+		"@nomideusz/svelte-calendar": "^1.9.0",
+		"@opentelemetry/api": "^1.9.1",
+		"@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
+		"@opentelemetry/resources": "^2.11.0",
+		"@opentelemetry/sdk-trace-node": "^2.11.0",
+		"@tracewayapp/frontend": "^1.2.0",
+		"@zaur/mail-core": "workspace:*",
+		"@zaur/server-auth": "workspace:*",
+		"@zaur/ui": "workspace:*",
+		"clsx": "^2.1.1",
+		"dompurify": "^3.4.16",
+		"livekit-client": "^2.21.0",
+		"livekit-server-sdk": "^2.17.0",
+		"pdfjs-dist": "^6.4.299",
+		"trix": "^2.1.19",
+		"valibot": "^1.5.0",
+		"web-push": "^3.6.7"
+	}
+}

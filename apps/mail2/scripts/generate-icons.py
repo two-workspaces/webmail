@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Draw the plain set of the app's icons: an envelope (static/icons/mail/, the
+default). PUBLIC_APP_ICON picks the set at runtime; Zaur's (static/icons/zaur/,
+its bird) is drawn by scripts/zaur-bird.py.
+
+On a 16-unit grid, an envelope 12 x 8, its flap a faint stroke. White on the
+accent blue, deepening downward (--z-accent-stroke to --z-accent-edge).
+ZaurMark.svelte draws the same paths in the shell's ink (#lib/brand.ts mirrors
+them).
+
+Every file comes from the one SVG below, favicon.svg included.
+
+    python3 scripts/generate-icons.py      # writes into static/icons/ (needs cairosvg, Pillow)
+
+The plain set's favicon.ico also goes to static/, for browsers that ask
+/favicon.ico before reading the page.
+"""
+import io
+from pathlib import Path
+
+import cairosvg
+from PIL import Image
+
+STATIC = Path(__file__).resolve().parent.parent / "static"
+
+# The mark on its grid, faint stroke then bold — mirrored in src/lib/brand.ts.
+MARKS = {
+    "mail": ("M2 4L8 8L14 4", "M2 4H14V12H2Z"),
+}
+def svg(mark: tuple[str, str], share: float, stroke: float, radius: float, tile: bool = True) -> str:
+    """The mark scaled to `share` of a 16-unit tile with corner `radius`; `tile=False` leaves it bare (alpha only)."""
+    back = (
+        '<defs><linearGradient id="sky" x2="0" y2="1">'
+        '<stop offset="0" stop-color="#3b82f6"/><stop offset="1" stop-color="#1d4ed8"/>'
+        "</linearGradient></defs>"
+        f'<rect width="16" height="16" rx="{radius}" fill="url(#sky)"/>'
+        if tile
+        else ""
+    )
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+        f"{back}"
+        f'<g transform="translate(8 8) scale({share}) translate(-8 -8)" fill="none" stroke="#fff"'
+        f' stroke-width="{stroke}" stroke-linecap="round" stroke-linejoin="round">'
+        '<rect x="2" y="4" width="12" height="8" fill="#fff" fill-opacity="0.12" stroke="none"/>'
+        f'<path d="{mark[0]}" stroke-opacity="0.45"/>'
+        f'<path d="{mark[1]}"/>'
+        "</g></svg>\n"
+    )
+
+
+def png(source: str, size: int) -> Image.Image:
+    return Image.open(io.BytesIO(cairosvg.svg2png(bytestring=source.encode(), output_width=size))).convert("RGBA")
+
+
+def main() -> None:
+    for name, mark in MARKS.items():
+        out = STATIC / "icons" / name
+        out.mkdir(parents=True, exist_ok=True)
+        draw(out, mark)
+    (STATIC / "favicon.ico").write_bytes((STATIC / "icons" / "mail" / "favicon.ico").read_bytes())
+
+
+def draw(out: Path, mark: tuple[str, str]) -> None:
+    # Favicon: the mark nearly fills a rounded tile, heavier so it holds at 16px.
+    favicon = svg(mark, 1, 1.7, 3.5)
+    (out / "favicon.svg").write_text(favicon)
+    small = png(favicon, 48)
+    small.save(out / "favicon.png", optimize=True)
+    small.save(out / "favicon.ico", sizes=[(16, 16), (32, 32), (48, 48)])
+    # App icons: full bleed (the platform masks the corners); the envelope's
+    # corners stay inside the maskable safe circle.
+    for size, name in ((192, "icon-192.png"), (512, "icon-512.png"), (180, "apple-touch-icon.png")):
+        icon = png(svg(mark, 0.72, 1.5, 0), size)
+        (icon.convert("RGB") if name.startswith("apple") else icon).save(out / name, optimize=True)
+    # Android draws the status-bar badge from alpha alone.
+    png(svg(mark, 1, 1.6, 0, tile=False), 96).save(out / "badge.png", optimize=True)
+    print("wrote", ", ".join(sorted(p.name for p in out.iterdir() if p.is_file())))
+
+
+if __name__ == "__main__":
+    main()
