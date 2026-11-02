@@ -17,16 +17,18 @@ sign in with their mailbox email + password (app passwords and
 `password$totp` TOTP suffixes work); credentials are AES-256-GCM-sealed in a
 server-side SQLite store, the browser cookie only ever holds an opaque
 session id, and all JMAP traffic is proxied same-origin. The client is Zaur Mail 2: mail,
-contacts, calendar and server-side filter rules in one app, with drafts and
-an outbox that keep working offline, live updates over JMAP push, and phone
-and tablet layouts. It installs as a PWA. There's a [Stalwart template](https://railway.com/deploy/stalwart?referralCode=sLjDXb)
+calendar, contacts, files and server-side filter rules in one app, with optional
+video calls (Meet), drafts and an outbox that keep working offline, live updates
+over JMAP push, and phone and tablet layouts. It installs as a PWA. There's a [Stalwart template](https://railway.com/deploy/stalwart-1?referralCode=sLjDXb)
 on Railway too — deploy both for a complete self-hosted mail stack.
 
 ## Common Use Cases
 
 - Give a self-hosted Stalwart server the webmail UI it doesn't ship with
 - Small teams and families running their own mail who want a fast, modern
-  client with contacts, calendars and vacation responses
+  client with calendars, contacts, files and vacation responses
+- Video calls from a calendar event, with guests joining from a link, once
+  you add a LiveKit Cloud project
 - A browser and phone client for any JMAP account, with new-mail push
   notifications once you add VAPID keys
 
@@ -41,7 +43,7 @@ on Railway too — deploy both for a complete self-hosted mail stack.
 - [Zaur Mail 2 README](https://github.com/nomideusz/zaur/blob/main/apps/mail2/README.md)
 - [Source on GitHub](https://github.com/nomideusz/zaur) (`apps/mail2`)
 - [Stalwart mail server](https://stalw.art) — pair with the
-  [Stalwart template](https://railway.com/deploy/stalwart?referralCode=sLjDXb)
+  [Stalwart template](https://railway.com/deploy/stalwart-1?referralCode=sLjDXb)
 
 ### Implementation Details
 
@@ -59,6 +61,10 @@ Notes:
 - **Push notifications:** generate keys with `npx web-push generate-vapid-keys`
   and set `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`. Without
   them the app still updates live while open; it just can't notify when closed.
+- **Video calls:** create a LiveKit Cloud project and set `LIVEKIT_URL`,
+  `LIVEKIT_API_KEY` and `LIVEKIT_API_SECRET`. Calendar then offers a Video call
+  switch, and guests join from the link without an account. Without all three,
+  Meet stays off.
 - The interface is neutral "Webmail" by default; rebrand it with
   `PUBLIC_APP_NAME`, `PUBLIC_BRAND_NAME`, `PUBLIC_MAIL_DOMAIN` and `PUBLIC_APP_ICON`.
 - Calendars, quotas and vacation responses are feature-probed, so the client
